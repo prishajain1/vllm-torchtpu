@@ -67,7 +67,7 @@ All environment variables read by `vllm-torchtpu` are declared and validated in 
 | Variable | Default | Description |
 | :--- | :--- | :--- |
 | `VLLM_TPU_BLOCK_MAJOR_KV` | `False` | Selects the block-major KV cache memory layout for Ragged Paged Attention. |
-| `TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL` | `None` | Enables the unified KV cache block pool across hybrid attention layers (e.g., GDN + Full Attention or MLA). |
+| `TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL` | `None` | Enables the unified KV cache block pool across hybrid attention layers (e.g., GDN + Full Attention or MLA). Unset: on for the pooled GDN / KDA architectures, off otherwise. Off on a hybrid model selects the per-layer layout: attention KV blocks plus `max_num_reqs + 1` compact mamba slots (or the uniform layout, which pads every block to the mamba page, when a KV connector other than DecodeBench is configured). On the compact layout `--num-gpu-blocks-override` sets the attention block count and the mamba slots stay compact. |
 | `TPU_LATENT_PROJ_INTRA_CHIP_TP` | `False` | Shards MLA latent projections across the 2 TensorCores of a single TPU v7x chip when `TP=1`. |
 | `TPU_MLA_MASKED_DENSE_ENABLED` | `False` | Enables the masked-dense MLA attention path for short KV lengths. |
 | `TPU_SPARSE_MLA_NOPE_LAYOUT` | `"sparsecore"` | Memory layout for Sparse MLA non-positional (`nope`) KV cache (`"sparsecore"` or `"tc"`). |
