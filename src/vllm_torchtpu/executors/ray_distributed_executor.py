@@ -35,10 +35,12 @@ from vllm.v1.executor.ray_executor import (
 from vllm.v1.executor.ray_executor import RayWorkerMetaData
 from vllm.v1.executor.ray_utils import WORKER_SPECIFIC_ENV_VARS, _wait_until_pg_ready
 from vllm.v1.executor.ray_utils import RayWorkerWrapper as RayWorkerWrapperV1
+from vllm.v1.kv_cache_interface import KVCacheSpec
 from vllm.v1.outputs import ModelRunnerOutput
 
 from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.distributed.utils import set_node_kv_ip_port
+from vllm_torchtpu.executors.kv_block_override import reconcile_num_gpu_blocks_override
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.platforms.tpu_platform import get_tpu_multihost_topology
 from vllm_torchtpu.runner.tpu_runner import AsyncTPUModelRunnerOutput
@@ -539,6 +541,24 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
                     assert len(self.pp_tp_workers[pp_rank]) == tp_rank
                     assert pp_rank < len(self.pp_tp_workers)
                     self.pp_tp_workers[pp_rank].append(self.workers[rank])
+
+    def get_kv_cache_specs(self) -> list[dict[str, KVCacheSpec]]:
+        specs = super().get_kv_cache_specs()
+
+        if self.vllm_config.cache_config.num_gpu_blocks_override is None:
+            # Compact-mamba sizing sets `num_gpu_blocks_override` on the worker's
+            # cache_config during the RPC above, and the workers then skip their
+            # profile run; workers are separate processes, so copy it to the
+            # engine-side config here, as TpuMultiprocExecutor does.
+            pc = self.vllm_config.parallel_config
+            agreed = reconcile_num_gpu_blocks_override(
+                cast(list, self.collective_rpc("get_num_gpu_blocks_override")),
+                workers_per_stage=pc.world_size // pc.pipeline_parallel_size,
+            )
+            if agreed is not None:
+                self.vllm_config.cache_config.num_gpu_blocks_override = agreed
+
+        return specs
 
     # Ray executor do not need handshake metadata
     # as we pass the kv_parameters through proxy server
