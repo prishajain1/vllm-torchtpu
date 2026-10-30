@@ -69,6 +69,7 @@ def make_runner(device, monkeypatch, k):
     runner.num_prompt_logprobs = {}
     runner._pre_async_results = None
     runner._mamba_state_pos = {}
+    runner._mamba_pos_pending = {}
     runner._mamba_offset_seeded = set()
     runner._read_offset_scratch = {}
     runner._last_sequence_layout_plan = None

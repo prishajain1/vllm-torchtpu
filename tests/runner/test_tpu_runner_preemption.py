@@ -52,6 +52,7 @@ def test_async_results_do_not_overwrite_recomputed_request(transition, num_draft
     runner._pre_async_results = previous
     runner._install_spec_token_room_guard = lambda: None
     runner._mamba_state_pos = {"resumed": 9, "continuing": 12}
+    runner._mamba_pos_pending = {}
     runner._mamba_offset_seeded = {"resumed", "continuing"}
     runner._mamba_slot_by_req_id = {"resumed": 1, "continuing": 1 + stride}
     runner._free_mamba_slots = []
