@@ -571,6 +571,10 @@ class TPUWorker(WorkerBase):
                 f"{-total_hbm_avail_gb}GiB. Please consider {fix}."
             )
 
+        # Compact-mamba sizing ran before the profile run; size it again
+        # against what the profile run left.
+        self.model_runner.kv_cache_manager.resize_compact_mamba_after_profile()
+
         cap = self._pooling_kv_cache_cap_bytes()
         if cap is not None and cap < available:
             logger.info(
