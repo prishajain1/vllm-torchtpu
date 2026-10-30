@@ -265,6 +265,7 @@ if TYPE_CHECKING:
     VLLM_TPU_VERIFY_FUSED_READ_OFFSETS: bool = False
     VLLM_TPU_DRAFT_SEED_EXTRAS: bool = False
     VLLM_TPU_DRAFT_SEED_BOOTSTRAP_PAD: bool = False
+    VLLM_TPU_MAMBA_SEED_NONBLOCKING: bool = False
     VLLM_TPU_CPU_PIN_RESERVE: int = 2
     VLLM_TPU_CPU_PROBE_S: float = 0.0
     VLLM_TPU_FUSED_READ_OFFSET_UPDATE: bool = True
@@ -1604,6 +1605,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Prefill-bootstrap draft seed scatter at the loop bucket width (a
     # precompiled key) instead of the real request count (mid-serve compiles).
     "VLLM_TPU_DRAFT_SEED_BOOTSTRAP_PAD": env_bool("VLLM_TPU_DRAFT_SEED_BOOTSTRAP_PAD"),
+    # Near a mamba block edge, pick the async-spec seed copy on device from the
+    # previous step's rejected counts instead of waiting for its tokens on the
+    # host (tpu_runner._collect_mamba_state_seed_copies).
+    "VLLM_TPU_MAMBA_SEED_NONBLOCKING": env_bool("VLLM_TPU_MAMBA_SEED_NONBLOCKING"),
     "VLLM_TPU_CPU_PIN_RESERVE": env_nonnegative_int("VLLM_TPU_CPU_PIN_RESERVE", 2),
     # Log each worker's thread CPU placement every N seconds (0 = off).
     "VLLM_TPU_CPU_PROBE_S": env_float("VLLM_TPU_CPU_PROBE_S", 0.0),

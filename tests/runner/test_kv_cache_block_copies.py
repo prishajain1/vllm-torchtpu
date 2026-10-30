@@ -32,6 +32,7 @@ def _runner_with_raw_tensors(raw_tensors):
     runner = object.__new__(TPUModelRunner)
     runner.requests = {}
     runner._mamba_state_pos = {}
+    runner._mamba_pos_pending = {}
     runner._mamba_offset_seeded = set()
     runner._pre_async_results = None
     runner._unified_kv_layout = bool(raw_tensors)

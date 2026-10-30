@@ -97,6 +97,8 @@ def _make_self(
         speculative_config=None,
         _pre_async_results=None,
         _mamba_state_pos=dict(state_pos or {}),
+        _mamba_pos_pending={},
+        max_num_reqs=16,
         _mamba_offset_seeded=set(req_ids),
         _mamba_state_block_size=state_block_size,
         _pool_block_split=split,
@@ -121,9 +123,13 @@ def _make_self(
     # class methods are already callable as-is.
     ns._bucket_len = TPUModelRunner._bucket_len
     ns._pad_to_bucket = TPUModelRunner._pad_to_bucket
+    ns._rejected_cpu = TPUModelRunner._rejected_cpu
     for name in (
         "_spec_seed_copies",
         "_copy_mamba_state_blocks",
+        "_resolve_mamba_state_pos",
+        "_padded_num_rejected",
+        "_num_rejected_width",
     ):
         setattr(ns, name, getattr(TPUModelRunner, name).__get__(ns))
     return ns, raws
@@ -944,3 +950,87 @@ def test_async_state_seed_keeps_actual_crossing_when_all_drafts_accepted():
     _collect(fake, _sched({"a": 4}))
     assert fake._mamba_state_pos["a"] == 1
     assert _real_pairs(fake._pending_mamba_state_copies[0]) == [(8, 6)]
+
+
+# --- VLLM_TPU_MAMBA_SEED_NONBLOCKING ------------------------------------------
+
+
+def _async_spec_case(nonblocking, monkeypatch, rejected, groups):
+    """Requests "a" (near the 384-token edge: crosses iff <= 2 of its 3 drafts
+    were rejected) and "b" (crosses into column 1 whatever the acceptance), with the
+    previous step's tokens either awaited (blocking) or decided on device."""
+    monkeypatch.setattr(
+        runner_mod.envs, "VLLM_TPU_MAMBA_SEED_NONBLOCKING", nonblocking, raising=False
+    )
+    offsets = torch.zeros(NUM_BLOCKS, dtype=torch.int32)
+    offsets[5] = 2
+    offsets[10] = 1
+    rows = [[5, 6, 7, 8, 9], [10, 11, 12, 13, 14]]
+    fake, pools = _make_self(
+        ["a", "b"],
+        [383, 757],
+        [rows] * groups if groups == 1 else [rows, [[20, 21, 22, 23, 24], [25, 26, 27, 28, 29]]],
+        state_pos={"a": 0, "b": 0},
+        state_block_size=384,
+        ckpt_window=4,
+        read_offsets=offsets,
+    )
+    sampled = torch.tensor(
+        [[77] * (4 - rejected) + [-1] * rejected, [77, 88, 99, 11]]
+    )
+    waits = []
+
+    def wait_for_copy():
+        waits.append(1)
+        return sampled
+
+    fake.scheduler_config = SimpleNamespace(async_scheduling=True)
+    fake.speculative_config = SimpleNamespace(num_speculative_tokens=3)
+    fake._pre_async_results = SimpleNamespace(
+        req_id_to_index_copy={"a": 0, "b": 1},
+        num_draft_per_req={0: 3, 1: 3},
+        spec_decode_num_rejected_tokens=torch.tensor([rejected, 0], dtype=torch.int32),
+        copy_state=object(),
+        wait_for_copy=wait_for_copy,
+    )
+    _collect(fake, _sched({"a": 4, "b": 4}))
+    staged = [(_real_pairs(c)) for c in fake._pending_mamba_state_copies]
+    waited_in_collect = len(waits)
+    fake._resolve_mamba_state_pos()
+    return staged, offsets.clone(), dict(fake._mamba_state_pos), waited_in_collect
+
+
+@pytest.mark.parametrize("rejected", [0, 1, 2, 3])
+@pytest.mark.parametrize("groups", [1, 2])
+def test_nonblocking_seed_matches_blocking_seed(monkeypatch, rejected, groups):
+    blocking = _async_spec_case(False, monkeypatch, rejected, groups)
+    nonblocking = _async_spec_case(True, monkeypatch, rejected, groups)
+    # The same seed copies, read-offset resets and state columns.
+    assert nonblocking[0] == blocking[0]
+    assert torch.equal(nonblocking[1], blocking[1])
+    assert nonblocking[2] == blocking[2]
+    crossed = rejected <= 2
+    assert nonblocking[2]["a"] == (1 if crossed else 0)
+    assert blocking[3] == 1
+    # One buffer set: decided on device, no wait. Two: decided on the host.
+    assert (nonblocking[3] == 0) == (groups == 1)
+
+
+def test_nonblocking_seed_program_keeps_only_crossed_rows():
+    offsets = torch.zeros(NUM_BLOCKS, dtype=torch.int32)
+    offsets[5] = 1
+    offsets[6] = offsets[16] = 3
+    packed = torch.tensor(
+        [
+            [5, 0, 1, 6, 5, 7, 8, 9],  # conditional, crossed
+            [5, 0, 1, 16, 5, 7, 8, 9],  # conditional, not crossed
+            [5, 0, 1, 26, 5, 7, 8, 9],  # unconditional
+            [0, 1, 0, 0, 0, 0, 0, 0],  # bucket padding
+        ]
+    )
+    cond = torch.tensor([[1, 0, 2], [1, 1, 2], [0, 0, 0], [0, 0, 0]])
+    num_rejected = torch.tensor([2, 3], dtype=torch.int32)
+    src, dst = runner_mod._spec_seed_rows_cond_impl(offsets, packed, cond, num_rejected, 1)
+    assert list(zip(src.tolist(), dst.tolist())) == [(7, 6), (0, 0), (7, 26), (0, 0)]
+    assert int(offsets[6]) == 0 and int(offsets[26]) == 0
+    assert int(offsets[16]) == 3  # not crossed: no reset
