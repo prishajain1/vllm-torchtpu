@@ -109,11 +109,16 @@ def _pooled_physical_mamba_spec(spec: KVCacheSpec) -> KVCacheSpec:
 
 def _is_deepseek_v32_indexer_spec(spec: KVCacheSpec) -> bool:
     """True for packed uint8 DSA indexer K-cache (`DeepseekV32IndexerCache`)."""
+    from vllm_torchtpu.platforms.tpu_block_size_utils import (
+        is_turboquant_kv_cache_dtype,
+    )
+
     return (
         isinstance(spec, MLAAttentionSpec)
         and not spec.dtype.is_floating_point
         and spec.tokens_per_state == 1
         and spec.cache_dtype_str != "fp8_ds_mla"
+        and not is_turboquant_kv_cache_dtype(spec.cache_dtype_str)
         and getattr(spec, "model_version", None) != "deepseek_v4"
     )
 

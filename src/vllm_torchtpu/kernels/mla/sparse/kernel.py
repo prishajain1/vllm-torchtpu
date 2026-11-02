@@ -33,6 +33,8 @@ DEFAULT_GATHER_AND_ATTENTION_CHUNK_SIZE = 64
 DEFAULT_ATTENTION_KERNEL_BATCH_SIZE = 16
 # The native SparseCore gather's unit, which `topk_cap` must be a multiple of.
 GATHER_ATOM_ROWS = native_sc_gather.OCCURRENCES_PER_ATOM
+# Unroll factor for the TurboQuant per-token attention loop.
+_TQ_UNROLL = 2
 
 
 def cdiv(a, b):
@@ -431,7 +433,12 @@ def _attention_kernel(
     capped_windows: int | None = None,
     split_q: bool = False,
     lse_lane_dense: bool = False,
+    turboquant: bool = False,
 ):
+    rope_scale = k_scale
+    if turboquant:
+        assert sparsecore_layout
+        k_scale = 1.0
     # Split-q mode (`split_q`): `q_hbm_ref` holds q_nope only and the rope
     # part arrives as a separate input `q_pe_hbm_ref` (first of `refs`), with
     # its own VMEM double buffer (last scratch ref). The two are joined and
@@ -498,7 +505,7 @@ def _attention_kernel(
     nope_dim = kv_cache_utils.WORD_BYTES * kv_cache_utils.TILE_LANE_BYTES
     assert kv_lens_ref.shape[0] == num_tokens
     bkv_sz = (
-        cache_kv_nope_hbm_ref.shape[1]
+        cache_kv_nope_hbm_ref.shape[1] * (2 if turboquant else 1)
         if sparsecore_layout
         else cache_kv_nope_hbm_ref.shape[1] // kv_cache_utils.WORD_BYTES
     )
@@ -735,7 +742,102 @@ def _attention_kernel(
             lambda: kv_lens_ref[batch_start_seq_idx + batch_idx],
         )
 
+    def _unpack_tq_nope(bkv_nope_ref):
+        from vllm_torchtpu.layers.core import turboquant as tq
+
+        half = tq.MLA_TQ_NOPE_BYTES
+        fp8_lo, fp8_hi = tq.unpack_mla_fp8_nibbles_u32(bkv_nope_ref[...])
+        return (
+            pltpu.bitcast(fp8_lo, jnp.float8_e4m3fn).reshape(bkv_sz, half),
+            pltpu.bitcast(fp8_hi, jnp.float8_e4m3fn).reshape(bkv_sz, half),
+        )
+
+    def _unpack_tq_rope_and_norm(bkv_rope_ref):
+        from vllm_torchtpu.layers.core import turboquant as tq
+
+        rope_i32 = pltpu.bitcast(bkv_rope_ref[...], jnp.int32)
+        off = tq.MLA_TQ_NORM_BYTE_OFFSET
+        lane_i32 = lax.broadcasted_iota(jnp.int32, rope_i32.shape, 1)
+        lo_i32 = jnp.sum(jnp.where(lane_i32 == off, rope_i32, 0), axis=1, keepdims=True)
+        hi_i32 = jnp.sum(
+            jnp.where(lane_i32 == off + 1, rope_i32, 0), axis=1, keepdims=True
+        )
+        lo_u8 = pltpu.bitcast(
+            jnp.broadcast_to(lo_i32, rope_i32.shape), jnp.uint8
+        ).reshape(bkv_sz, 128)
+        hi_u8 = pltpu.bitcast(
+            jnp.broadcast_to(hi_i32, rope_i32.shape), jnp.uint8
+        ).reshape(bkv_sz, 128)
+        norm_col = tq._bf16_u16_to_f32_vreg(
+            lo_u8.astype(jnp.uint32), hi_u8.astype(jnp.uint32)
+        )[:, :1]
+        rope_pe_i32 = jnp.where(lane_i32 < off, rope_i32, 0)
+        rope = pltpu.bitcast(rope_pe_i32, jnp.float8_e4m3fn).reshape(bkv_sz, 128)
+        return rope, norm_col
+
+    def tq_split_entry(bkv_nope_ref, bkv_rope_ref, q_nope, q_pe_128, kv_len):
+        """TurboQuant attention for one query token without K/V concats.
+
+        The 512-dim latent arrives as two `[bkv_sz, 256]` nibble planes (codes
+        `0..255` and `256..511`); scores are the sum of three partial matmuls
+        (lo, hi, rope) and the value product skips the rope tail entirely.
+        """
+        rope, norm_col = _unpack_tq_rope_and_norm(bkv_rope_ref)
+        k_lo, k_hi = _unpack_tq_nope(bkv_nope_ref)
+        half = k_lo.shape[1]
+
+        def mm(a, b):
+            return jnp.einsum("nd,md->nm", a, b, preferred_element_type=jnp.float32)
+
+        s_rope = mm(q_pe_128, rope)
+        if rope_scale != 1.0:
+            s_rope = s_rope * rope_scale
+        s_nope = mm(q_nope[:, :half], k_lo) + mm(q_nope[:, half : 2 * half], k_hi)
+        kv_span = lax.broadcasted_iota(jnp.int32, s_nope.shape, 1)
+        norm_row = jnp.where(kv_span[:1, :] < kv_len, jnp.swapaxes(norm_col, 0, 1), 0.0)
+        s = (s_nope * norm_row + s_rope) * sm_scale
+        s = jnp.where(kv_span < kv_len, s, jnp.finfo(jnp.float32).min)
+        m = jnp.max(s, axis=1, keepdims=True)
+        p = jnp.exp(s - m)
+        l_sum = jnp.sum(p, axis=1, keepdims=True)
+        pb = (p * norm_row).astype(jnp.bfloat16)
+
+        def pv(b):
+            return jnp.einsum("nm,md->nd", pb, b, preferred_element_type=jnp.float32)
+
+        acc = jnp.concatenate([pv(k_lo), pv(k_hi)], axis=-1)
+        out = (
+            lax.div(acc, l_sum)
+            if q_dtype == jnp.float32
+            else (acc * pl.reciprocal(l_sum, approx=True)).astype(q_dtype)
+        )
+        if o_dim > out.shape[-1]:
+            out = jnp.concatenate(
+                [out, jnp.zeros((out.shape[0], o_dim - out.shape[-1]), q_dtype)],
+                axis=-1,
+            )
+        return out[:, :o_dim], l_sum, m
+
     def unpack_bkv(bkv_nope_ref, bkv_rope_ref, get_kv_len):
+        if turboquant:
+            k_lo, k_hi = _unpack_tq_nope(bkv_nope_ref)
+            rope, norm_col = _unpack_tq_rope_and_norm(bkv_rope_ref)
+            kv_len = get_kv_len()
+            k_row = lax.broadcasted_iota(jnp.int32, norm_col.shape, 0)
+            norm_col = jnp.where(k_row < kv_len, norm_col, 0.0)
+            nope = (
+                jnp.concatenate([k_lo, k_hi], axis=-1).astype(jnp.float32) * norm_col
+            ).astype(jnp.bfloat16)
+            rope_bf16 = (
+                (rope.astype(jnp.float32) * rope_scale).astype(jnp.bfloat16)
+                if rope_scale != 1.0
+                else rope.astype(jnp.bfloat16)
+            )
+            bkv = jnp.concatenate([nope, rope_bf16], axis=-1)
+            if bkv.shape[-1] < head_dim:
+                bkv = jnp.pad(bkv, ((0, 0), (0, head_dim - bkv.shape[-1])))
+            k_span = lax.broadcasted_iota(jnp.int32, bkv.shape, 0)
+            return jnp.where(k_span < kv_len, bkv, 0)
         bkv_nope = bkv_nope_ref[...]
         if sparsecore_layout:
             # Native SC returns one uint32[128] row per token. Bitcasting
@@ -928,39 +1030,74 @@ def _attention_kernel(
             if return_lse:
                 _send_blse_batch(batch_start_seq_idx, bo_sem_idx, wait=True)
 
-        for batch_idx in range(batch_size):
-            kv_len = kv_lens_ref[batch_start_seq_idx + batch_idx]
-            bkv = load_bkv(bi_sem_idx, batch_idx)
-            bq = load_bq(bi_sem_idx, batch_idx)
+        if turboquant:
 
-            if prev_out is not None:
-                # Artificial dependency to force MXU/VPU interleaving by limiting
-                # LLO's QK runahead
-                # We use jnp.where to prevent XLA from optimizing the dependency away.
-                # prev_out won't be inf in practice.
-                bq = jnp.where(prev_out == jnp.inf, prev_out, bq)
+            def tq_entry(batch_idx, carry):
+                kv_len = kv_lens_ref[batch_start_seq_idx + batch_idx]
+                if split_q:
+                    q_nope = bq_x2_ref.at[bi_sem_idx, batch_idx][...]
+                    assert bq_pe_x2_ref is not None
+                    q_pe_raw = bq_pe_x2_ref.at[bi_sem_idx, batch_idx][...]
+                    q_pe_128 = (
+                        jnp.pad(
+                            q_pe_raw,
+                            ((0, 0), (0, 128 - q_pe_raw.shape[-1])),
+                        )
+                        if q_pe_raw.shape[-1] < 128
+                        else q_pe_raw[:, :128]
+                    )
+                else:
+                    bq = load_bq(bi_sem_idx, batch_idx)
+                    q_nope = bq[:, :512]
+                    q_pe_128 = bq[:, 512:640]
+                out, l_sum, m = tq_split_entry(
+                    bkv_nope_x2_ref.at[bi_sem_idx, batch_idx],
+                    bkv_rope_x2_ref.at[bi_sem_idx, batch_idx],
+                    q_nope,
+                    q_pe_128,
+                    kv_len,
+                )
+                bo_x2_ref.at[bo_sem_idx, batch_idx][...] = out
+                write_blse(batch_idx, m, l_sum)
+                return carry
 
-            p, l_sum, m = attention_step1_qk_softmax(bq, bkv, kv_len)
+            lax.fori_loop(
+                0, batch_size, tq_entry, 0, unroll=min(_TQ_UNROLL, batch_size)
+            )
+        else:
+            for batch_idx in range(batch_size):
+                kv_len = kv_lens_ref[batch_start_seq_idx + batch_idx]
+                bkv = load_bkv(bi_sem_idx, batch_idx)
+                bq = load_bq(bi_sem_idx, batch_idx)
 
-            if prev_p is not None:
-                assert prev_bkv is not None
-                assert prev_l_sum is not None
-                out = attention_step2_pv(prev_p, prev_bkv, prev_l_sum)
+                if prev_out is not None:
+                    # Artificial dependency to force MXU/VPU interleaving by limiting
+                    # LLO's QK runahead
+                    # We use jnp.where to prevent XLA from optimizing the dependency
+                    # away. prev_out won't be inf in practice.
+                    bq = jnp.where(prev_out == jnp.inf, prev_out, bq)
 
-                # Store output from acc to bo.
-                bo_x2_ref.at[bo_sem_idx, batch_idx - 1][...] = out[:, :o_dim]
-                write_blse(batch_idx - 1, prev_m, prev_l_sum)
-                prev_out = out
+                p, l_sum, m = attention_step1_qk_softmax(bq, bkv, kv_len)
 
-            prev_p = p
-            prev_bkv = bkv
-            prev_l_sum = l_sum
-            prev_m = m
+                if prev_p is not None:
+                    assert prev_bkv is not None
+                    assert prev_l_sum is not None
+                    out = attention_step2_pv(prev_p, prev_bkv, prev_l_sum)
 
-        # end of pipelining loop
-        out = attention_step2_pv(prev_p, prev_bkv, prev_l_sum)
-        bo_x2_ref.at[bo_sem_idx, batch_size - 1][...] = out[:, :o_dim]
-        write_blse(batch_size - 1, prev_m, prev_l_sum)
+                    # Store output from acc to bo.
+                    bo_x2_ref.at[bo_sem_idx, batch_idx - 1][...] = out[:, :o_dim]
+                    write_blse(batch_idx - 1, prev_m, prev_l_sum)
+                    prev_out = out
+
+                prev_p = p
+                prev_bkv = bkv
+                prev_l_sum = l_sum
+                prev_m = m
+
+            # end of pipelining loop
+            out = attention_step2_pv(prev_p, prev_bkv, prev_l_sum)
+            bo_x2_ref.at[bo_sem_idx, batch_size - 1][...] = out[:, :o_dim]
+            write_blse(batch_size - 1, prev_m, prev_l_sum)
         if capped_windows is not None:
             fixup_capped_overflow(bi_sem_idx, bo_sem_idx)
         start_send_bo_batch(batch_start_seq_idx, bo_sem_idx)
@@ -1061,6 +1198,7 @@ def prepare_outputs(
         "live_gather_all_chunks",
         "topk_cap",
         "lse_lane_dense",
+        "turboquant",
     ),
 )
 def sparse_ragged_paged_attention(
@@ -1095,6 +1233,7 @@ def sparse_ragged_paged_attention(
     topk_cap: int | None = None,
     q_pe: jax.Array | None = None,
     lse_lane_dense: bool = False,
+    turboquant: bool = False,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -1170,6 +1309,9 @@ def sparse_ragged_paged_attention(
             f"{SPARSECORE_CACHE_LAYOUT!r}, got {cache_layout!r}"
         )
     sparsecore_layout = cache_layout == SPARSECORE_CACHE_LAYOUT
+    if turboquant and not sparsecore_layout:
+        raise NotImplementedError("TurboQuant sparse MLA needs the sparsecore layout")
+    nope_tokens_per_row = 2 if turboquant else 1
     if sparsecore_layout:
         if (
             cache_kv_nope.dtype != jnp.uint32
@@ -1177,7 +1319,7 @@ def sparse_ragged_paged_attention(
             or cache_kv_nope.shape[-1] != 128
         ):
             raise ValueError(
-                "sparsecore NOPE cache must be uint32[pages,page_size,128]"
+                "sparsecore NOPE cache must be uint32[pages,nope_rows,128]"
             )
         if (
             cache_kv_rope.dtype != jnp.uint32
@@ -1188,11 +1330,16 @@ def sparse_ragged_paged_attention(
                 "sparsecore ROPE cache must be uint32[pages,rope_rows,128]"
             )
         rope_rows = cache_kv_rope.shape[1]
-        if rope_rows <= 0 or cache_kv_nope.shape[1] % rope_rows != 0:
+        logical_page_size = cache_kv_nope.shape[1] * nope_tokens_per_row
+        if rope_rows <= 0 or logical_page_size % rope_rows != 0:
             raise ValueError(
                 "NOPE and ROPE caches must have matching page counts and page geometry"
             )
-        rope_tokens_per_row = cache_kv_nope.shape[1] // rope_rows
+        rope_tokens_per_row = logical_page_size // rope_rows
+        if turboquant and rope_tokens_per_row != 4:
+            raise ValueError(
+                "TurboQuant sparse MLA requires 4 tokens per ROPE row (128 B/token)"
+            )
         rope_words = (
             128 // rope_tokens_per_row if 128 % rope_tokens_per_row == 0 else -1
         )
@@ -1223,14 +1370,18 @@ def sparse_ragged_paged_attention(
             raise ValueError(
                 "tensorcore ROPE cache must be uint8[pages,page_size/4,4,128]"
             )
-    if cache_kv_nope.size != rope_tokens_per_row * cache_kv_rope.size:
+    if (
+        cache_kv_nope.size * nope_tokens_per_row
+        != rope_tokens_per_row * cache_kv_rope.size
+    ):
         raise ValueError(
-            f"NOPE cache size ({cache_kv_nope.size}) must be exactly "
-            f"{rope_tokens_per_row} * ROPE cache size ({cache_kv_rope.size})"
+            f"NOPE cache size ({cache_kv_nope.size}) * {nope_tokens_per_row} "
+            f"must equal {rope_tokens_per_row} * ROPE cache size ({cache_kv_rope.size})"
         )
     if (
         cache_kv_nope.shape[0] != cache_kv_rope.shape[0]
-        or cache_kv_nope.shape[1] != rope_tokens_per_row * cache_kv_rope.shape[1]
+        or cache_kv_nope.shape[1] * nope_tokens_per_row
+        != rope_tokens_per_row * cache_kv_rope.shape[1]
     ):
         raise ValueError(
             "NOPE and ROPE caches must have matching page counts and page geometry"
@@ -1251,7 +1402,7 @@ def sparse_ragged_paged_attention(
     else:
         q = prepare_q_inputs(q)  # [max_num_tokens, num_q_heads, head_dim]
 
-    page_size = cache_kv_nope.shape[1]
+    page_size = cache_kv_nope.shape[1] * nope_tokens_per_row
 
     _, num_q_heads, _ = q.shape
 
@@ -1379,6 +1530,7 @@ def sparse_ragged_paged_attention(
             ),
             q_pe=q_pe,
             lse_lane_dense=lse_lane_dense,
+            turboquant=turboquant,
         )
         if return_lse:
             q, lse = result
@@ -1480,6 +1632,7 @@ def sparse_attention_chunk(
     window_indices: jax.Array | None = None,
     q_pe: jax.Array | None = None,
     lse_lane_dense: bool = False,
+    turboquant: bool = False,
 ):
     """Gathers and attends query rows `[start_pos, min(end_pos, token_end))`.
 
@@ -1525,6 +1678,10 @@ def sparse_attention_chunk(
         head_dim = align_to(head_dim + q_pe.shape[-1], 128)
     chunk_size = end_pos - start_pos
     capped_windows = None if topk_cap is None else topk // topk_cap
+    if turboquant and not sparsecore_layout:
+        raise NotImplementedError("TurboQuant sparse MLA needs the sparsecore layout")
+    nope_words = 64 if turboquant else 128
+    nope_tokens_per_row = 128 // nope_words
 
     def run_mla_kernel(
         q: jax.Array,  # [max_num_tokens, num_q_heads, head_dim]
@@ -1630,6 +1787,7 @@ def sparse_attention_chunk(
             capped_windows=capped_windows,
             split_q=split_q,
             lse_lane_dense=lse_lane_dense,
+            turboquant=turboquant,
         )
 
         scope_name = (
@@ -1638,6 +1796,8 @@ def sparse_attention_chunk(
         )
         if capped_windows is not None:
             scope_name += f"-capw_{capped_windows}"
+        if turboquant:
+            scope_name += "-tq"
         num_prefetch = len(scalar_prefetches)
         kernel = jax.named_scope(scope_name)(
             pl.pallas_call(
@@ -1751,10 +1911,11 @@ def sparse_attention_chunk(
                 serve_pipelined=sparsecore_gather_pipelined,
                 num_live_indices=num_live_capped,
                 live_multiple=kernel_batch_size * topk_cap,
+                nope_words=nope_words,
             )
         )
         gathered_nope_buffer = gathered_nope_buffer.reshape(
-            capped_windows * chunk_size, topk_cap, 128
+            capped_windows * chunk_size, topk_cap // nope_tokens_per_row, 128
         )
         gathered_rope_buffer = gathered_rope_buffer.reshape(
             capped_windows * chunk_size, topk_cap // native_sc_gather.ROPE_PACKING, 128
@@ -1782,10 +1943,13 @@ def sparse_attention_chunk(
                 atoms_per_batch=gather_atoms,
                 wait_mode=sparsecore_gather_wait_mode,
                 serve_pipelined=sparsecore_gather_pipelined,
+                nope_words=nope_words,
                 **live_kwargs,
             )
         )
-        gathered_nope_buffer = gathered_nope_buffer.reshape(chunk_size, topk, 128)
+        gathered_nope_buffer = gathered_nope_buffer.reshape(
+            chunk_size, topk // nope_tokens_per_row, 128
+        )
         gathered_rope_buffer = gathered_rope_buffer.reshape(
             chunk_size, topk // native_sc_gather.ROPE_PACKING, 128
         )

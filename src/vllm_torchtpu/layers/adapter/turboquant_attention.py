@@ -55,6 +55,10 @@ logger = init_logger(__name__)
 
 _MODEL_AXIS_NAME = "model"
 
+# Sparse (DSA) MLA supports only the key+value MSE-rotated 4-bit preset: the
+# latent is a shared K/V vector (256 B = 64 words = half a 128-word SC row).
+MLA_TURBOQUANT_PRESETS = ("turboquant_4bit_nc",)
+
 # Active preset in this process: `get_kv_cache_shape` and friends may receive
 # the storage dtype (`torch.uint8`) rather than the preset string.
 _active_preset: str | None = None
@@ -112,6 +116,22 @@ def get_tq_tables(preset: str, head_dim: int) -> tq.TQTables:
     with torch.device("cpu"):
         centroids = get_centroids(head_dim, bits).cpu().numpy().astype(np.float32)
     return tq.make_tables(layout, centroids)
+
+
+def active_mla_turboquant_preset(
+    cache_dtype: str | torch.dtype | None = None,
+) -> str | None:
+    """Active preset if it is a sparse-MLA TurboQuant preset, else `None`."""
+    if isinstance(cache_dtype, str) and not is_turboquant_kv_cache_dtype(cache_dtype):
+        return None
+    preset = _resolve_preset(cache_dtype)
+    return preset if preset in MLA_TURBOQUANT_PRESETS else None
+
+
+@functools.cache
+def get_mla_latent_tables() -> tq.TQTables:
+    """Builds Hadamard and SWAR `float8_e4m3fn` tables for 512-dim MLA latent."""
+    return tq.make_mla_latent_tables()
 
 
 def validate_turboquant_head_dim(head_dim: int) -> None:
@@ -304,44 +324,82 @@ class PallasTurboQuantAttentionBackendImpl(PallasAttentionBackendImpl):
         self._kernel_op_prefix = f"pallas::tq_rpa_kernel_{preset}"  # type: ignore[misc]
 
 
+def _check_turboquant_sparse_mla(preset: str, model_config, cache_config) -> None:
+    """Validate TurboQuant for sparse (DSA) MLA models such as GLM-5.2."""
+    from vllm_torchtpu import envs
+
+    if preset not in MLA_TURBOQUANT_PRESETS:
+        raise NotImplementedError(
+            f"TurboQuant on sparse MLA models supports {MLA_TURBOQUANT_PRESETS} "
+            f"(the latent is shared between K and V), got {preset!r}."
+        )
+    hf_text = getattr(model_config, "hf_text_config", None)
+    if getattr(hf_text, "index_topk", None) is None:
+        raise NotImplementedError(
+            "TurboQuant KV cache on MLA models requires sparse (DSA) MLA "
+            "(hf_text_config.index_topk set, e.g. GLM-5.2); dense MLA is not "
+            "supported."
+        )
+    kv_lora_rank = getattr(hf_text, "kv_lora_rank", None)
+    if kv_lora_rank != tq.MLA_TQ_LATENT_DIM:
+        raise NotImplementedError(
+            f"TurboQuant sparse MLA requires kv_lora_rank={tq.MLA_TQ_LATENT_DIM}, "
+            f"got {kv_lora_rank}."
+        )
+    if (
+        envs.TPU_SPARSE_MLA_NOPE_LAYOUT != "sparsecore"
+        or envs.TPU_SPARSE_MLA_ROPE_LAYOUT != "sparsecore"
+    ):
+        raise NotImplementedError(
+            "TurboQuant sparse MLA requires TPU_SPARSE_MLA_NOPE_LAYOUT=sparsecore "
+            "and TPU_SPARSE_MLA_ROPE_LAYOUT=sparsecore."
+        )
+    if cache_config.user_specified_block_size and (
+        cache_config.block_size < 32 or cache_config.block_size % 32 != 0
+    ):
+        raise ValueError(
+            "TurboQuant sparse MLA requires block_size to be a multiple of 32, "
+            f"got block_size={cache_config.block_size}."
+        )
+
+
 def check_turboquant_config(vllm_config: VllmConfig) -> None:
     """Platform-level validation, called from `TpuPlatform.check_and_update_config`."""
     cache_config = vllm_config.cache_config
     preset = cache_config.cache_dtype.lower().strip()
     set_active_turboquant_preset(preset)
-    supported_block_sizes = _supported_block_sizes(preset)
-    if (
-        cache_config.user_specified_block_size
-        and cache_config.block_size not in supported_block_sizes
-    ):
-        raise ValueError(
-            f"TurboQuant KV cache ({preset}) supports block_size in "
-            f"{supported_block_sizes}, got block_size={cache_config.block_size}."
-        )
-
     model_config = vllm_config.model_config
-    if model_config is not None:
-        if model_config.use_mla:
-            raise NotImplementedError(
-                "TurboQuant KV cache does not support MLA models."
+
+    if model_config is not None and model_config.use_mla:
+        _check_turboquant_sparse_mla(preset, model_config, cache_config)
+    else:
+        supported_block_sizes = _supported_block_sizes(preset)
+        if (
+            cache_config.user_specified_block_size
+            and cache_config.block_size not in supported_block_sizes
+        ):
+            raise ValueError(
+                f"TurboQuant KV cache ({preset}) supports block_size in "
+                f"{supported_block_sizes}, got block_size={cache_config.block_size}."
             )
-        validate_turboquant_head_dim(model_config.get_head_size())
-        if not cache_config.user_specified_block_size:
-            cache_config.block_size = (  # type: ignore[assignment]
-                PallasTurboQuantAttentionBackend.get_page_size(vllm_config)
-            )
-        if model_config.is_hybrid:
-            if cache_config.enable_prefix_caching:
-                logger.warning_once(
-                    "TurboQuant KV cache on hybrid Mamba+Attention models uses the "
-                    "compact Mamba state layout rather than the unified KV pool; "
-                    "disabling prefix caching (enable_prefix_caching=False, "
-                    "mamba_cache_mode='none')."
+        if model_config is not None:
+            validate_turboquant_head_dim(model_config.get_head_size())
+            if not cache_config.user_specified_block_size:
+                cache_config.block_size = (  # type: ignore[assignment]
+                    PallasTurboQuantAttentionBackend.get_page_size(vllm_config)
                 )
-                cache_config.enable_prefix_caching = False
-            if cache_config.mamba_cache_mode == "align":
-                cache_config.mamba_cache_mode = "none"
-            cache_config.mamba_block_size = model_config.max_model_len
+            if model_config.is_hybrid:
+                if cache_config.enable_prefix_caching:
+                    logger.warning_once(
+                        "TurboQuant KV cache on hybrid Mamba+Attention models uses "
+                        "the compact Mamba state layout rather than the unified KV "
+                        "pool; disabling prefix caching (enable_prefix_caching=False, "
+                        "mamba_cache_mode='none')."
+                    )
+                    cache_config.enable_prefix_caching = False
+                if cache_config.mamba_cache_mode == "align":
+                    cache_config.mamba_cache_mode = "none"
+                cache_config.mamba_block_size = model_config.max_model_len
 
     parallel = vllm_config.parallel_config
     if parallel.prefill_context_parallel_size > 1:
@@ -360,7 +418,7 @@ def check_turboquant_config(vllm_config: VllmConfig) -> None:
         cache_config.kv_cache_dtype_skip_layers = []
 
     logger.info_once(
-        "TurboQuant KV cache (%s) on TPU uses fused Pallas RPA v3 VREG "
+        "TurboQuant KV cache (%s) on TPU uses fused Pallas VREG "
         "dequantization with per-step quantized page updates.",
         preset,
     )
