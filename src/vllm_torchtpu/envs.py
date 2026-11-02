@@ -255,6 +255,8 @@ if TYPE_CHECKING:
     VLLM_TPU_SUBTRACT_REJECTED_COMPILED: bool = False
     VLLM_TPU_SPEC_TAIL_COMPILED: bool = False
     VLLM_TPU_STALL_WATCHDOG_S: float = 0.0
+    VLLM_TPU_LOOP_LAG_WATCHDOG_S: float = 30.0
+    VLLM_TPU_FREEZE_PYSPY_S: float = 120.0
     VLLM_TPU_VERIFY_FUSED: bool = False
     VLLM_TPU_VERIFY_FUSED_CHECK: int = 0
     VLLM_TPU_VERIFY_FUSED_CHECK_FAULT: int = 0
@@ -1571,6 +1573,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Dump all processes' stacks when no step starts for N s with live
     # requests (stall_watchdog.py; read directly there, registered here).
     "VLLM_TPU_STALL_WATCHDOG_S": env_float("VLLM_TPU_STALL_WATCHDOG_S", 0.0),
+    # With the stall watchdog on: dump the API server's stacks when its event
+    # loop blocks for N s (stall_watchdog.py; read directly there).
+    "VLLM_TPU_LOOP_LAG_WATCHDOG_S": env_float("VLLM_TPU_LOOP_LAG_WATCHDOG_S", 30.0),
+    # With the stall watchdog on: an out-of-process monitor runs py-spy dump
+    # --native on the API server and its children when a heartbeat or progress
+    # stops for N s (freeze_spy.py; read directly there; 0 disables).
+    "VLLM_TPU_FREEZE_PYSPY_S": env_float("VLLM_TPU_FREEZE_PYSPY_S", 120.0),
     # Non-greedy spec verify as one program (tpu_runner._verify_fused_impl).
     "VLLM_TPU_VERIFY_FUSED": env_bool("VLLM_TPU_VERIFY_FUSED"),
     # Compare the fused verify and draft seed with the separate programs for
