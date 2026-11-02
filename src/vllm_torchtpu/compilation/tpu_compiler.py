@@ -307,6 +307,7 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # Same reason: dcp.py owns the DCP kernels' mesh shape and device order.
     "vllm_torchtpu/distributed/dcp.py",
     "vllm_torchtpu/distributed/pallas_shapes.py",
+    "vllm_torchtpu/runner/pcp",
     "vllm_torchtpu/layers/adapter/linear_common.py",
     "vllm_torchtpu/layers/adapter/router_topk.py",
     "vllm_torchtpu/layers/adapter/quantization",

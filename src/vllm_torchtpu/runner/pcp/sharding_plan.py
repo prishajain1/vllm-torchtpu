@@ -26,6 +26,13 @@ import numpy as np
 import torch
 
 from vllm_torchtpu.distributed.pcp import all_reduce_sum
+from vllm_torchtpu.layers.core.pcp_sequence_layout import (
+    ensure_host_token_buffer_capacity,
+)
+from vllm_torchtpu.layers.core.sequence_layout import (
+    DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR,
+    SequenceLayoutDescriptor,
+)
 
 if TYPE_CHECKING:
     from vllm_torchtpu.layers.core.pcp_metadata import PcpMetadata
@@ -43,17 +50,7 @@ def round_up_to_bucket(paddings: list[int] | tuple[int, ...], value: int) -> int
 
 
 def grow_host_token_buffers(runner: Any, required: int) -> None:
-    if len(runner.arange_np) < required:
-        runner.arange_np = np.arange(required, dtype=np.int64)
-    current = int(runner.input_ids_cpu.shape[0])
-    if current >= required:
-        return
-    for name in ("input_ids_cpu", "positions_cpu"):
-        old = getattr(runner, name)
-        new = torch.zeros(required, dtype=old.dtype, device=old.device)
-        new[:current] = old
-        setattr(runner, name, new)
-    runner.positions_np = runner.positions_cpu.numpy()
+    ensure_host_token_buffer_capacity(runner, required)
 
 
 class PcpShardingPlan(ABC):
@@ -67,6 +64,7 @@ class PcpShardingPlan(ABC):
         self.pcp_size = int(pcp_size)
         self.pcp_rank = int(pcp_rank)
         self.dcp_size = int(dcp_size)
+        self.page_size = 0
         self._reset_step_state()
 
     def _reset_step_state(self) -> None:
@@ -101,8 +99,25 @@ class PcpShardingPlan(ABC):
     @abstractmethod
     def max_local_num_tokens(self) -> int: ...
 
+    @property
+    def sequence_layout_descriptor(self) -> SequenceLayoutDescriptor:
+        return DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR
+
+    @property
+    def requires_backend_preinit(self) -> bool:
+        return False
+
+    @property
+    def local_compile_token_multiple(self) -> int:
+        return 1
+
     def set_page_size(self, page_size: int) -> None:
         self.page_size = int(page_size)
+
+    def configure_kv_cache(
+        self, kv_cache_config: Any, kernel_block_size: int | None = None
+    ) -> None:
+        del kv_cache_config, kernel_block_size
 
     @abstractmethod
     def prepare_real(

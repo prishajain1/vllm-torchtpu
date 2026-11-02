@@ -93,13 +93,12 @@ class PcpStaticSupportValidator:
                 "cp_kv_cache_interleave_size to be a multiple of 128, "
                 f"got {config.interleave_size}."
             )
-        if not config.enabled:
-            return config
-
-        if envs.USE_TPU_PCP_MANAGER:
+        if envs.USE_TPU_PCP_MANAGER and vllm_config is not None:
             from vllm_torchtpu.runner.pcp import validate_pcp_manager_config
 
             validate_pcp_manager_config(vllm_config)
+            return config
+        if not config.enabled:
             return config
         if config.dcp_size > 1:
             raise NotImplementedError("PCP with DCP requires USE_TPU_PCP_MANAGER=1.")

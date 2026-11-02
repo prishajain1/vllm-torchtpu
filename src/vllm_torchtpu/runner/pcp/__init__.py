@@ -12,9 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """PCP manager (`USE_TPU_PCP_MANAGER=1`): `PcpManager` (`manager.py`) and its
-sharding plans (`sharding_plan.py`, `head_tail_sharding_plan.py`)."""
+sharding plans (`head_tail_sharding_plan.py`, `interleaved_sharding_plan.py`)."""
 
-from vllm_torchtpu.runner.pcp.head_tail_sharding_plan import mla_kv_page_size
+from vllm_torchtpu.runner.pcp.head_tail_sharding_plan import (
+    HeadTailPcpShardingPlan,
+    mla_kv_page_size,
+)
+from vllm_torchtpu.runner.pcp.interleaved_sharding_plan import (
+    InterleavedPcpShardingPlan,
+    attention_kv_page_size,
+    interleaved_max_local_tokens,
+)
 from vllm_torchtpu.runner.pcp.manager import PcpManager, validate_pcp_manager_config
 
-__all__ = ["PcpManager", "mla_kv_page_size", "validate_pcp_manager_config"]
+__all__ = [
+    "HeadTailPcpShardingPlan",
+    "InterleavedPcpShardingPlan",
+    "PcpManager",
+    "attention_kv_page_size",
+    "interleaved_max_local_tokens",
+    "mla_kv_page_size",
+    "validate_pcp_manager_config",
+]

@@ -415,6 +415,12 @@ class HeadTailPcpShardingPlan(PcpShardingPlan):
             self.num_ws_pages * self.virtual_page_size,
         )
 
+    def configure_kv_cache(
+        self, kv_cache_config: Any, kernel_block_size: int | None = None
+    ) -> None:
+        del kernel_block_size
+        self.set_page_size(mla_kv_page_size(kv_cache_config))
+
     def _rep_window_size(self, target_num_reqs: int) -> int:
         """Decode window rows: `min(target_num_reqs, max_num_seqs)` rounded up
         to a multiple of `dcp_size` (`streamindex_topk_dcp` requires it).
