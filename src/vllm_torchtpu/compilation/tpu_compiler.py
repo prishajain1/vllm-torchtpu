@@ -38,12 +38,14 @@ from typing import Any
 
 import torch
 import torch._guards
+import torch.distributed.distributed_c10d as c10d
 import torch.fx as fx
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch_tpu._internal.compile._backend import TpuBackend
 from vllm.compilation.compiler_interface import CompilerInterface
 from vllm.config import VllmConfig
 from vllm.config.utils import Range
+from vllm.distributed import parallel_state
 
 from vllm_torchtpu import envs, utils
 from vllm_torchtpu.compilation import shape_variants
@@ -111,21 +113,211 @@ def wait_for_peer_artifact(timeout_s: float):
         _peer_wait.timeout_s = 0.0
 
 
+_GROUP_ARG_NAMES = frozenset({"group_name", "group"})
+
+_SYMMETRIC_COLLECTIVE_SCHEMAS = frozenset(
+    {
+        "_c10d_functional::all_reduce",
+        "_c10d_functional::all_reduce_",
+        "_c10d_functional::all_reduce_coalesced",
+        "_c10d_functional::all_reduce_coalesced_",
+        "_c10d_functional::all_gather_into_tensor",
+        "_c10d_functional::all_gather_into_tensor_out",
+        "_c10d_functional::all_gather_into_tensor_coalesced",
+        "_c10d_functional::reduce_scatter_tensor",
+        "_c10d_functional::reduce_scatter_tensor_out",
+        "_c10d_functional::reduce_scatter_tensor_coalesced",
+        "_c10d_functional::all_to_all_single",
+        "_c10d_functional_autograd::all_gather_into_tensor",
+        "_c10d_functional_autograd::reduce_scatter_tensor",
+        "_c10d_functional_autograd::all_to_all_single",
+        "tpu::_all_gather_dim",
+        "tpu::_reduce_scatter_dim",
+        "vllm::all_reduce",
+        "vllm::all_gather",
+        "vllm::reduce_scatter",
+        "vllm::patched_fused_scaled_matmul_reduce_scatter",
+    }
+)
+
+
+def _find_vllm_group(group_name: str) -> Any | None:
+    """Find a registered vLLM `GroupCoordinator` by `unique_name` or `device_group`."""
+    group_ref = parallel_state._groups.get(group_name)
+    if group_ref is not None:
+        group = group_ref()
+        if group is not None:
+            return group
+    for group_ref in parallel_state._groups.values():
+        group = group_ref()
+        if (
+            group is not None
+            and group.device_group is not None
+            and group.device_group.group_name == group_name
+        ):
+            return group
+    return None
+
+
+def _resolve_group_metadata(
+    group_name: str,
+) -> tuple[
+    str | None,
+    str | None,
+    int | None,
+    tuple[int, ...] | None,
+    tuple[tuple[int, ...], ...] | None,
+]:
+    """Return `(kind, role, size, ranks, group_ranks)` for `group_name`."""
+    group = _find_vllm_group(group_name)
+    if group is not None:
+        role = group.unique_name.partition(":")[0]
+        ranks = tuple(int(r) for r in group.ranks)
+        group_ranks = (
+            tuple(tuple(int(r) for r in sg) for sg in group.group_ranks)
+            if group.group_ranks
+            else None
+        )
+        return ("vllm_pg", role, int(group.world_size), ranks, group_ranks)
+
+    try:
+        pg = c10d._resolve_process_group(c10d.GroupName(group_name))
+        ranks = tuple(int(r) for r in c10d.get_process_group_ranks(pg))
+    except (KeyError, ValueError, RuntimeError):
+        return (None, None, None, None, None)
+    if ranks:
+        return ("c10d_pg", None, len(ranks), ranks, None)
+    return (None, None, None, None, None)
+
+
+def _canonicalize_process_group_name(group_name: str, ordinal: int) -> str:
+    """Map a rank-local process-group handle to a canonical token.
+
+    TorchTPU tiles every symmetric subgroup collective's `replica_groups`
+    across all `world_size` partitions via `GatherAllSubgroups`, so ranks in
+    different subgroups compile identical all-device SPMD executables. When a
+    vLLM `GroupCoordinator` is registered for `group_name` (either by
+    `unique_name` or `device_group.group_name`), its full `group_ranks`
+    partition is encoded directly so wrap-around subgroup layouts (such as
+    `tpu7x` topology-aware PCP/TP meshes) match across all subgroups. Raw
+    `c10d` groups fall back to subgroup size and rank-stride geometry.
+    """
+    kind, role, size, ranks, group_ranks = _resolve_group_metadata(group_name)
+    strides = (
+        tuple(ranks[i + 1] - ranks[i] for i in range(len(ranks) - 1))
+        if ranks is not None and len(ranks) > 1
+        else ()
+    )
+    if kind == "vllm_pg":
+        if group_ranks is not None:
+            return f"vllm_pg:{ordinal}:{role}:size={size}:group_ranks={group_ranks}"
+        return f"vllm_pg:{ordinal}:{role}:size={size}:strides={strides}"
+    if kind == "c10d_pg":
+        return f"c10d_pg:{ordinal}:size={size}:strides={strides}"
+    raise ValueError(f"Cannot resolve process group {group_name!r}")
+
+
+def _node_schema(target: Any) -> Any | None:
+    if isinstance(target, torch._ops.OpOverload):
+        return target._schema
+    if (
+        isinstance(target, torch._ops.OpOverloadPacket)
+        and "default" in target.overloads()
+    ):
+        return target.default._schema
+    return None
+
+
+def _normalized_module_code(
+    module: fx.GraphModule,
+    canonical_by_raw: dict[str, str] | None = None,
+) -> str:
+    """Return `module.code` with symmetric collective `group_name`s canonicalized.
+
+    Only symmetric subgroup collectives in `_SYMMETRIC_COLLECTIVE_SCHEMAS` are
+    canonicalized; rooted or point-to-point ops with a `group_name`/`group`
+    string argument raise `ValueError` so `_graph_fingerprint` returns `None`.
+    """
+    saved: list[tuple[fx.Node, tuple[Any, ...], dict[str, Any]]] = []
+    if canonical_by_raw is None:
+        canonical_by_raw = {}
+
+    def _canonical(raw: str) -> str:
+        token = canonical_by_raw.get(raw)
+        if token is None:
+            token = _canonicalize_process_group_name(raw, len(canonical_by_raw))
+            canonical_by_raw[raw] = token
+        return token
+
+    try:
+        for node in module.graph.nodes:
+            if node.op != "call_function":
+                continue
+            schema = _node_schema(node.target)
+            if schema is None:
+                continue
+            new_args: list[Any] | None = None
+            new_kwargs: dict[str, Any] | None = None
+
+            for idx, arg_spec in enumerate(schema.arguments):
+                if arg_spec.name not in _GROUP_ARG_NAMES:
+                    continue
+                has_pos_str = idx < len(node.args) and isinstance(node.args[idx], str)
+                val = node.kwargs.get(arg_spec.name)
+                has_kw_str = isinstance(val, str)
+                if not has_pos_str and not has_kw_str:
+                    continue
+                if schema.name not in _SYMMETRIC_COLLECTIVE_SCHEMAS:
+                    raise ValueError(
+                        f"Cannot canonicalize non-symmetric collective {schema.name!r}"
+                    )
+                if has_pos_str:
+                    if new_args is None:
+                        new_args = list(node.args)
+                    new_args[idx] = _canonical(node.args[idx])
+                if has_kw_str:
+                    if new_kwargs is None:
+                        new_kwargs = dict(node.kwargs)
+                    new_kwargs[arg_spec.name] = _canonical(val)
+
+            if new_args is not None or new_kwargs is not None:
+                saved.append((node, node.args, node.kwargs))
+                if new_args is not None:
+                    node.args = tuple(new_args)
+                if new_kwargs is not None:
+                    node.kwargs = new_kwargs
+
+        if not saved:
+            return module.code
+        return module.graph.python_code(root_module="self").src
+    finally:
+        for node, orig_args, orig_kwargs in saved:
+            node.args = orig_args
+            node.kwargs = orig_kwargs
+
+
 def _graph_fingerprint(graph: fx.GraphModule) -> str | None:
     """Hash of the code of `graph` and its submodules and of their constants.
 
     Two ranks with the same fingerprint traced the same program, so either can
     replay the other's artifact. A rank-dependent value baked into the graph,
     e.g. a Python int from `rank_in_group`, changes the code and so the hash.
-    None if the graph cannot be hashed; its artifact is then only replayed by
-    the rank that saved it.
+    Rank-local `c10d` `group_name` identifiers on symmetric subgroup collectives
+    are canonicalized via `_normalized_module_code` because TorchTPU lowers
+    symmetric subgroup collectives into global SPMD HLO covering all partitions.
+    None if the graph cannot be hashed (including when a group cannot be
+    resolved or a non-symmetric collective is present); its artifact is then
+    only replayed by the rank that saved it.
     """
     try:
         h = hashlib.sha256()
+        canonical_by_raw: dict[str, str] = {}
         for name, module in graph.named_modules():
             if not isinstance(module, fx.GraphModule):
                 continue
-            h.update(f"{name}\n{module.code}".encode())
+            h.update(
+                f"{name}\n{_normalized_module_code(module, canonical_by_raw)}".encode()
+            )
             for node in module.graph.nodes:
                 if node.op != "get_attr":
                     continue
