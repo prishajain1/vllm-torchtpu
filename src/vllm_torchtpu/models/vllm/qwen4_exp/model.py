@@ -684,6 +684,21 @@ class Qwen4ExpBackbone(nn.Module):
             return mixed, hidden
         return mixed
 
+    def _megakernel_host_ple(self, input_ids, query_start_loc, ngram_context):
+        """With PLE CPU offload, the per-layer embedding rows of the megakernel programs'
+        PLE layer, looked up on the host as ``_forward_impl`` does (None with the table
+        on HBM). The kernels never read the PLE table: apply_ple runs before the head
+        group that starts at the PLE layer, so the host rows go in there."""
+        if self.host_ple_index is None:
+            return None
+        if not envs.VLLM_TPU_MK_HOST_PLE:
+            raise AssertionError("segments need the PLE table on HBM (or VLLM_TPU_MK_HOST_PLE=1)")
+        ple = cast(Qwen4ExpDecoderLayer, self.layers[self.host_ple_index]).ple
+        assert ple is not None
+        return ple.lookup_for_model(
+            PLEInputs(input_ids, query_start_loc, ngram_context), query_start_loc[-1:]
+        )
+
     def forward_segments(
         self,
         input_ids,
@@ -708,7 +723,7 @@ class Qwen4ExpBackbone(nn.Module):
         projection and MoE, then the linear-attention layers until the next QSA
         layer (the last segment ends after ``l``'s MoE).
         """
-        assert self.host_ple_index is None, "segments need the PLE table on HBM"
+        ple_raw = self._megakernel_host_ple(input_ids, query_start_loc, ngram_context)
         positions64 = positions.to(torch.int64)
         ids64 = input_ids.to(torch.int64)
         hidden = self.embed_tokens(input_ids).repeat(1, self.hc_count)
@@ -736,7 +751,8 @@ class Qwen4ExpBackbone(nn.Module):
                         )
                     continue
                 hidden = layers[group[0]].apply_ple(
-                    hidden, ids64, query_start_loc, ngram_context, state_slots, context_lens
+                    hidden, ids64, query_start_loc, ngram_context, state_slots, context_lens,
+                    ple_raw if group[0] == self.host_ple_index else None,
                 )
                 hidden = segment_call.head(h, hidden)
         else:
@@ -773,7 +789,12 @@ class Qwen4ExpBackbone(nn.Module):
         # `mk_segment_set`: only these segments run their kernel (bisection).
         mk_set = getattr(segment_call, "mk_segment_set", None)
         ends = qsa_layers[1:] + [len(layers)]
+        stop_last = bool(getattr(segment_call, "stop_before_last", False))
         for s, i in enumerate(qsa_layers):
+            if stop_last and s == len(qsa_layers) - 1:
+                # `wholecheck` cut reference: the residual entering the last QSA layer,
+                # before its cache-writing attention core.
+                return hidden
             layer = layers[i]
             if s >= n_mk or (mk_set is not None and s not in mk_set):
                 for stock in layers[i : ends[s]]:
@@ -790,13 +811,13 @@ class Qwen4ExpBackbone(nn.Module):
                         compressed_block_table,
                     )
                 continue
-            block, _ = layer.attn_hyper_connection.mix(hidden)
+            block, _ = layer.attn_hyper_connection.mix(hidden, small_rows=True)
             if in_kernel:
                 attention = layer.self_attn.select_for_kernel(block, positions64, metadata)
             else:
                 attention = layer.self_attn.attend(block, positions64, metadata)
             hidden = segment_call(s, hidden, attention)
-        mixed = self.hyper_connection_mixer.mix(hidden)[0]
+        mixed = self.hyper_connection_mixer.mix(hidden, small_rows=True)[0]
         if self.emit_mtp_hidden:
             return mixed, hidden
         return mixed
@@ -815,6 +836,7 @@ class Qwen4ExpBackbone(nn.Module):
         valid_tokens,
         main_block_table,
         compressed_block_table,
+        with_pre_last=False,
     ):
         """``forward_segments`` with layers ``whole``'s first .. last-1 in ONE whole-step
         megakernel call (attention, indexer and cache writes in-kernel / in-call).
@@ -822,17 +844,19 @@ class Qwen4ExpBackbone(nn.Module):
         Head groups as in ``forward_segments``; then ``whole`` (layers 3..46); the last QSA
         layer keeps its stock attention core and the segment kernel for the rest.
         """
-        assert self.host_ple_index is None, "segments need the PLE table on HBM"
+        ple_raw = self._megakernel_host_ple(input_ids, query_start_loc, ngram_context)
         ids64 = input_ids.to(torch.int64)
         positions64 = positions.to(torch.int64)
         hidden = self.embed_tokens(input_ids).repeat(1, self.hc_count)
         layers = cast(Sequence[Qwen4ExpDecoderLayer], self.layers)
         for h, group in enumerate(segment_call.head_groups):
             hidden = layers[group[0]].apply_ple(
-                hidden, ids64, query_start_loc, ngram_context, state_slots, context_lens
+                hidden, ids64, query_start_loc, ngram_context, state_slots, context_lens,
+                ple_raw if group[0] == self.host_ple_index else None,
             )
             hidden = segment_call.head(h, hidden)
         hidden = whole(hidden, positions, query_start_loc, context_lens)
+        pre_last = hidden
         qsa_layers = [i for i, layer in enumerate(layers) if layer.layer_type == "full_attention"]
         last = layers[qsa_layers[-1]]
         metadata = QSAMetadata(
@@ -840,13 +864,15 @@ class Qwen4ExpBackbone(nn.Module):
         )
         cap = getattr(segment_call, "attention_rows", 0)  # as forward_segments
         in_kernel = bool(cap) and int(hidden.shape[0]) <= cap
-        block, _ = last.attn_hyper_connection.mix(hidden)
+        block, _ = last.attn_hyper_connection.mix(hidden, small_rows=True)
         if in_kernel:
             attention = last.self_attn.select_for_kernel(block, positions64, metadata)
         else:
             attention = last.self_attn.attend(block, positions64, metadata)
         hidden = segment_call(len(qsa_layers) - 1, hidden, attention)
-        mixed = self.hyper_connection_mixer.mix(hidden)[0]
+        mixed = self.hyper_connection_mixer.mix(hidden, small_rows=True)[0]
+        if with_pre_last:  # `wholecheck` shadow: also the residual entering the last QSA layer
+            return mixed, pre_last
         if self.emit_mtp_hidden:
             return mixed, hidden
         return mixed
@@ -996,6 +1022,154 @@ class Qwen4ExpWholeStepModel(nn.Module):
             positions,
             self.segments,
             self.whole,
+            query_start_loc=query_start_loc,
+            ngram_context=ngram_context,
+            state_slots=state_slots,
+            context_lens=context_lens,
+            valid_tokens=valid_tokens,
+            main_block_table=main_block_table,
+            compressed_block_table=compressed_block_table,
+        )
+
+
+@support_torch_compile(
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": 0,
+        "inputs_embeds": 0,
+        "valid_tokens": 0,
+    }
+)
+class Qwen4ExpWholeStepShadowModel(nn.Module):
+    """`wholecheck`: the whole-step program built over write-free kernels, returning the
+    output and the residual entering the last QSA layer. Its own class and forward: a second
+    ``Qwen4ExpWholeStepModel`` instance would share the served program's compiled graph."""
+
+    def __init__(self, *, vllm_config, prefix: str = "", backbone, segments, whole) -> None:
+        super().__init__()
+        self.prefix = prefix
+        self.backbone = backbone
+        self.segments = segments
+        self.whole = whole
+
+    def forward(
+        self,
+        input_ids,
+        positions,
+        inputs_embeds=None,
+        *,
+        query_start_loc,
+        ngram_context,
+        state_slots,
+        context_lens,
+        valid_tokens,
+        main_block_table,
+        compressed_block_table,
+    ):
+        backbone = self.backbone
+        return type(backbone).forward_wholestep(
+            backbone,
+            input_ids,
+            positions,
+            self.segments,
+            self.whole,
+            query_start_loc=query_start_loc,
+            ngram_context=ngram_context,
+            state_slots=state_slots,
+            context_lens=context_lens,
+            valid_tokens=valid_tokens,
+            main_block_table=main_block_table,
+            compressed_block_table=compressed_block_table,
+            with_pre_last=True,
+        )
+
+
+@support_torch_compile(
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": 0,
+        "inputs_embeds": 0,
+        "valid_tokens": 0,
+    }
+)
+class Qwen4ExpSegmentShadowModel(nn.Module):
+    """`check=N`: the segment program over write-free kernels. Its own class and forward: a
+    second ``Qwen4ExpSegmentModel`` instance would share the served program's compiled graph."""
+
+    def __init__(self, *, vllm_config, prefix: str = "", backbone, segments) -> None:
+        super().__init__()
+        self.prefix = prefix
+        self.backbone = backbone
+        self.segments = segments
+
+    def forward(
+        self,
+        input_ids,
+        positions,
+        inputs_embeds=None,
+        *,
+        query_start_loc,
+        ngram_context,
+        state_slots,
+        context_lens,
+        valid_tokens,
+        main_block_table,
+        compressed_block_table,
+    ):
+        shadow_backbone = self.backbone
+        return type(shadow_backbone).forward_segments(
+            shadow_backbone,
+            input_ids,
+            positions,
+            self.segments,
+            query_start_loc=query_start_loc,
+            ngram_context=ngram_context,
+            state_slots=state_slots,
+            context_lens=context_lens,
+            valid_tokens=valid_tokens,
+            main_block_table=main_block_table,
+            compressed_block_table=compressed_block_table,
+        )
+
+
+@support_torch_compile(
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": 0,
+        "inputs_embeds": 0,
+        "valid_tokens": 0,
+    }
+)
+class Qwen4ExpSegmentCutModel(nn.Module):
+    """`wholecheck` reference: the segment program over write-free kernels, stopped at the
+    residual entering the last QSA layer (``segments.stop_before_last``)."""
+
+    def __init__(self, *, vllm_config, prefix: str = "", backbone, segments) -> None:
+        super().__init__()
+        self.prefix = prefix
+        self.backbone = backbone
+        self.segments = segments
+
+    def forward(
+        self,
+        input_ids,
+        positions,
+        inputs_embeds=None,
+        *,
+        query_start_loc,
+        ngram_context,
+        state_slots,
+        context_lens,
+        valid_tokens,
+        main_block_table,
+        compressed_block_table,
+    ):
+        backbone = self.backbone
+        return type(backbone).forward_segments(
+            backbone,
+            input_ids,
+            positions,
+            self.segments,
             query_start_loc=query_start_loc,
             ngram_context=ngram_context,
             state_slots=state_slots,
