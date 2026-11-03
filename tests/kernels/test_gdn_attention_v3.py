@@ -25,8 +25,13 @@ from jax._src.state import types as state_types
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import AbstractDevice, AbstractMesh, use_abstract_mesh
 
-from vllm_torchtpu import envs
-from vllm_torchtpu.kernels.gdn.v3 import compute_gdn, config, tiling, wrapper
+from vllm_torchtpu.kernels.gdn.v3 import (
+    compute_gdn,
+    config,
+    memory_ref,
+    tiling,
+    wrapper,
+)
 
 
 def _l2_normalize(x: jnp.ndarray, eps: float = 1e-6) -> jnp.ndarray:
@@ -350,6 +355,103 @@ class GDNAttentionTileSelectionTest(parameterized.TestCase):
                     )
                     self.assertEqual(got, expected, msg=label)
 
+    def test_gdn_vmem_declared_bytes_matches_create_allocs(self):
+        """Verifies 0 B delta between get_vmem_declared_bytes and create_allocs."""
+        mesh = AbstractMesh(
+            (), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu")
+        )
+        with use_abstract_mesh(mesh):
+            d_k = d_v = 128
+            kernel_size = 4
+            num_lanes = pltpu.get_tpu_info().num_lanes
+            f32 = jnp.dtype(jnp.float32)
+            bf16 = jnp.dtype(jnp.bfloat16)
+            dummy_meta = memory_ref.MetadataRef(
+                num_tiles=None,
+                p_id_to_s_idx=None,
+                p_id_to_r_base=None,
+                p_id_to_r_size=None,
+                p_id_is_first_tile=None,
+                p_id_is_last_tile=None,
+                s_idx_has_initial_state=None,
+                s_idx_to_state_indices=None,
+                s_idx_to_read_offset=None,
+                s_idx_to_ckpt_indices=None,
+            )
+            for mode in (config.GDNMode.BATCHED, config.GDNMode.PER_SEQ):
+                for n_kq, n_v, tile_sz, w_sz in [
+                    (2, 8, 8, 1),
+                    (2, 8, 8, 4),
+                    (8, 32, 4, 1),
+                    (16, 64, 32, 1),
+                ]:
+                    if mode == config.GDNMode.PER_SEQ and w_sz > 1:
+                        continue
+                    dim_sz = 2 * n_kq * d_k + n_v * d_v
+                    cfg = config.GDNConfig(
+                        mode=mode,
+                        dtypes=config.Dtypes(
+                            act_in=f32,
+                            act_out=bf16,
+                            compute=f32,
+                            recurrent_state=f32,
+                            conv_state=f32,
+                        ),
+                        batch_size=512,
+                        dim_size=dim_sz,
+                        kernel_size=kernel_size,
+                        tile_size=tile_sz,
+                        num_kq_heads=n_kq,
+                        num_v_heads=n_v,
+                        kq_head_dim=d_k,
+                        v_head_dim=d_v,
+                        attention_mode=config.AttentionMode.GDN,
+                        window_size=w_sz,
+                    )
+                    allocs = memory_ref.create_allocs(
+                        metadata_ref=dummy_meta,
+                        qkv_ref=f32,
+                        b_ref=f32,
+                        a_ref=f32,
+                        out_ref=bf16,
+                        conv_state_ref=f32,
+                        recurrent_state_ref=f32,
+                        cfg=cfg,
+                    )
+                    alloc_bytes = sum(
+                        int(np.prod(a.window_ref.shape))
+                        * jnp.dtype(a.window_ref.dtype).itemsize
+                        for a in allocs
+                        if a.window_ref is not None
+                    )
+                    scratch_bytes = sum(
+                        int(np.prod(s.shape)) * jnp.dtype(s.dtype).itemsize
+                        for s in cfg.get_scratch_shape_dict().values()
+                        if s is not None
+                    )
+                    weights_bytes = (kernel_size + 1) * tiling.align_to(
+                        dim_sz, num_lanes
+                    ) * 4 + (cfg.aligned_num_v_heads + cfg.aligned_gate_dim) * 4
+                    declared = tiling.get_vmem_declared_bytes(
+                        tile_b=cfg.seq_tile_size,
+                        chunk_sz=cfg.chunk_size,
+                        n_kq=n_kq,
+                        n_v=n_v,
+                        d_k=d_k,
+                        d_v=d_v,
+                        kernel_size=kernel_size,
+                        act_out_bytes=2,
+                        rec_state_bytes=4,
+                        num_lanes=num_lanes,
+                        conv_state_dim_size=dim_sz,
+                        is_decode=(mode == config.GDNMode.BATCHED),
+                        window_size=w_sz,
+                        attention_mode=config.AttentionMode.GDN,
+                    )
+                    self.assertEqual(
+                        declared, alloc_bytes + scratch_bytes + weights_bytes
+                    )
+
     def test_tile_sizes_with_split_state_slots_at_w1(self):
         """W=1 decode tiles count 1 input and 1 output state slot per sequence."""
         d_k, d_v, kernel_size = 128, 128, 4
@@ -385,6 +487,100 @@ class GDNAttentionTileSelectionTest(parameterized.TestCase):
                         window_size=1,
                     )
                     self.assertEqual(got, expected, msg=label)
+
+    def test_mixed_tile_size_power_of_two_and_max_cap(self):
+        """Verify mixed_tile_size power-of-two rounding and max_mixed_tile_size."""
+        d_k, d_v, kernel_size = 128, 128, 4
+        n_kq, n_v = 2, 4
+        dim = 2 * n_kq * d_k + n_v * d_v
+        bf16 = jnp.dtype(jnp.bfloat16)
+        f32 = jnp.dtype(jnp.float32)
+        mesh = AbstractMesh(
+            (), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu")
+        )
+        with use_abstract_mesh(mesh):
+            limit_w1 = config.GDNConfig.get_vmem_limit_bytes(1)
+            _, mixed_non_pow2 = tiling.get_tile_sizes(
+                batch_size=96,
+                num_seqs=1,
+                padded_batch_size=96,
+                n_kq=n_kq,
+                n_v=n_v,
+                d_k=d_k,
+                d_v=d_v,
+                kernel_size=kernel_size,
+                conv_state_dim_size=dim,
+                act_out_dtype=bf16,
+                recurrent_state_dtype=f32,
+                num_lanes=128,
+                decode_vmem_limit_bytes=limit_w1,
+                mixed_vmem_limit_bytes=limit_w1,
+                window_size=1,
+            )
+            self.assertEqual(mixed_non_pow2, 64)
+
+            _, mixed_capped = tiling.get_tile_sizes(
+                batch_size=512,
+                num_seqs=1,
+                padded_batch_size=512,
+                n_kq=n_kq,
+                n_v=n_v,
+                d_k=d_k,
+                d_v=d_v,
+                kernel_size=kernel_size,
+                conv_state_dim_size=dim,
+                act_out_dtype=bf16,
+                recurrent_state_dtype=f32,
+                num_lanes=128,
+                decode_vmem_limit_bytes=limit_w1,
+                mixed_vmem_limit_bytes=limit_w1,
+                window_size=1,
+                max_mixed_tile_size=64,
+            )
+            self.assertEqual(mixed_capped, 64)
+
+            dec_ov, mixed_ov_pow2 = tiling.get_tile_sizes(
+                batch_size=40,
+                num_seqs=8,
+                padded_batch_size=40,
+                n_kq=n_kq,
+                n_v=n_v,
+                d_k=d_k,
+                d_v=d_v,
+                kernel_size=kernel_size,
+                conv_state_dim_size=dim,
+                act_out_dtype=bf16,
+                recurrent_state_dtype=f32,
+                num_lanes=128,
+                decode_vmem_limit_bytes=limit_w1,
+                mixed_vmem_limit_bytes=limit_w1,
+                window_size=1,
+                decode_tile_size=4,
+                mixed_tile_size=64,
+            )
+            self.assertEqual((dec_ov, mixed_ov_pow2), (4, 32))
+
+        self.assertEqual(
+            config.GDNConfig(
+                mode=config.GDNMode.PER_SEQ,
+                dtypes=config.Dtypes(
+                    act_in=f32,
+                    act_out=bf16,
+                    compute=f32,
+                    recurrent_state=f32,
+                    conv_state=f32,
+                ),
+                batch_size=128,
+                dim_size=2 * 12 * d_k + 24 * d_v,
+                kernel_size=kernel_size,
+                tile_size=128,
+                num_kq_heads=12,
+                num_v_heads=24,
+                kq_head_dim=d_k,
+                v_head_dim=d_v,
+            ).triangular_block_size,
+            4,
+        )
 
 
 class GDNStatePipelineRaceTest(parameterized.TestCase):
@@ -481,7 +677,6 @@ class GDNStatePipelineRaceTest(parameterized.TestCase):
         try:
             with (
                 use_abstract_mesh(mesh),
-                mock.patch.object(envs, "TPU_ENABLE_GDN_DYNAMIC_TILING", False),
                 mock.patch.object(interpret_utils, "to_range", _resolve_to_range),
                 mock.patch.object(
                     shared_memory.SharedMemory,
@@ -1351,19 +1546,27 @@ class GDNAttentionTest(parameterized.TestCase):
                 d_v=d_v,
                 kernel_size=kernel_size,
             )
-            with mock.patch.object(envs, "TPU_ENABLE_GDN_DYNAMIC_TILING", False):
-                fn_static = jax.jit(
-                    wrapper.fused_conv1d_gdn.__wrapped__,
-                    static_argnames=["n_kq", "n_v", "d_k", "d_v", "kernel_size"],
-                )
-                (conv_static, rec_static), out_static = fn_static(**kwargs)
+            fn_static = jax.jit(
+                wrapper.fused_conv1d_gdn.__wrapped__,
+                static_argnames=[
+                    "n_kq",
+                    "n_v",
+                    "d_k",
+                    "d_v",
+                    "kernel_size",
+                    "decode_tile_size",
+                    "mixed_tile_size",
+                ],
+            )
+            (conv_static, rec_static), out_static = fn_static(
+                **kwargs, decode_tile_size=min(4, 64 // n_v), mixed_tile_size=64
+            )
 
-            with mock.patch.object(envs, "TPU_ENABLE_GDN_DYNAMIC_TILING", True):
-                fn_dyn = jax.jit(
-                    wrapper.fused_conv1d_gdn.__wrapped__,
-                    static_argnames=["n_kq", "n_v", "d_k", "d_v", "kernel_size"],
-                )
-                (conv_dyn, rec_dyn), out_dyn = fn_dyn(**kwargs)
+            fn_dyn = jax.jit(
+                wrapper.fused_conv1d_gdn.__wrapped__,
+                static_argnames=["n_kq", "n_v", "d_k", "d_v", "kernel_size"],
+            )
+            (conv_dyn, rec_dyn), out_dyn = fn_dyn(**kwargs)
 
             np.testing.assert_allclose(out_dyn, out_static, rtol=1e-2, atol=1e-2)
             np.testing.assert_allclose(conv_dyn, conv_static, rtol=1e-2, atol=1e-2)
@@ -1425,33 +1628,35 @@ class GDNAttentionTest(parameterized.TestCase):
             num_spec_tokens=num_spec_tokens,
         )
 
-        with mock.patch.object(envs, "TPU_ENABLE_GDN_DYNAMIC_TILING", False):
-            fn_static = jax.jit(
-                wrapper.fused_conv1d_gdn.__wrapped__,
-                static_argnames=[
-                    "n_kq",
-                    "n_v",
-                    "d_k",
-                    "d_v",
-                    "kernel_size",
-                    "num_spec_tokens",
-                ],
-            )
-            (conv_static, rec_static), out_static = fn_static(**kwargs)
+        fn_static = jax.jit(
+            wrapper.fused_conv1d_gdn.__wrapped__,
+            static_argnames=[
+                "n_kq",
+                "n_v",
+                "d_k",
+                "d_v",
+                "kernel_size",
+                "num_spec_tokens",
+                "decode_tile_size",
+                "mixed_tile_size",
+            ],
+        )
+        (conv_static, rec_static), out_static = fn_static(
+            **kwargs, decode_tile_size=1, mixed_tile_size=64
+        )
 
-        with mock.patch.object(envs, "TPU_ENABLE_GDN_DYNAMIC_TILING", True):
-            fn_dyn = jax.jit(
-                wrapper.fused_conv1d_gdn.__wrapped__,
-                static_argnames=[
-                    "n_kq",
-                    "n_v",
-                    "d_k",
-                    "d_v",
-                    "kernel_size",
-                    "num_spec_tokens",
-                ],
-            )
-            (conv_dyn, rec_dyn), out_dyn = fn_dyn(**kwargs)
+        fn_dyn = jax.jit(
+            wrapper.fused_conv1d_gdn.__wrapped__,
+            static_argnames=[
+                "n_kq",
+                "n_v",
+                "d_k",
+                "d_v",
+                "kernel_size",
+                "num_spec_tokens",
+            ],
+        )
+        (conv_dyn, rec_dyn), out_dyn = fn_dyn(**kwargs)
 
         np.testing.assert_allclose(out_dyn, out_static, rtol=1e-2, atol=1e-2)
         np.testing.assert_allclose(conv_dyn, conv_static, rtol=1e-2, atol=1e-2)
@@ -1543,7 +1748,6 @@ class GDNAttentionTest(parameterized.TestCase):
                 d_k=d_k,
                 d_v=d_v,
                 kernel_size=kernel_size,
-                decode_tile_size=decode_tile,
             )
             rec_np = np.asarray(rec_out, dtype=np.float32)
             ref_np = np.asarray(rec_ref, dtype=np.float32)
@@ -1575,12 +1779,9 @@ class GDNAttentionTest(parameterized.TestCase):
             np.testing.assert_allclose(conv_out, conv_ref, rtol=1e-5, atol=1e-5)
             np.testing.assert_allclose(out, out_ref, rtol=1e-5, atol=1e-5)
 
-    # The flag-off clamp would shrink `decode_tile` below the tiling pick.
-    @mock.patch.object(envs, "TPU_ENABLE_GDN_DYNAMIC_TILING", True)
     def test_batched_decode_initial_state_parity_fp32(self):
         self._run_batched_decode_initial_state_parity(jnp.dtype(jnp.float32))
 
-    @mock.patch.object(envs, "TPU_ENABLE_GDN_DYNAMIC_TILING", True)
     def test_batched_decode_initial_state_parity_bf16(self):
         self._run_batched_decode_initial_state_parity(jnp.dtype(jnp.bfloat16))
 
@@ -1779,6 +1980,7 @@ class GDNAttentionTest(parameterized.TestCase):
 
         for n_kq, n_v, num_seqs, num_spec_tokens, prefill_len, num_decodes in [
             (2, 8, 16, 3, 16, 0),  # TP8 DCP=4 c=16 MTP=3: 16-tok prefill in B=16
+            (2, 8, 16, 3, 0, 16),  # TP8 DCP=4 c=16 MTP=3 warmup: 16 decodes, B=16
             (8, 32, 16, 0, 12, 4),  # DP4TP2: 4 decodes + 12-tok prefill in B=16
             (16, 64, 16, 0, 12, 4),  # DP8: 4 decodes + 12-tok prefill in B=16
         ]:
@@ -1794,7 +1996,7 @@ class GDNAttentionTest(parameterized.TestCase):
                 init_rec = jax.random.normal(
                     k9, (num_blocks, n_v, d_k, d_v), dtype=jnp.float32
                 )
-                active_seqs = num_decodes + 1
+                active_seqs = num_decodes + (1 if prefill_len > 0 else 0)
                 state_indices = jnp.arange(num_seqs, dtype=jnp.int32) * window
                 common_kwargs = dict(
                     qkv=jax.random.normal(k1, (batch_size, dim), dtype=jnp.bfloat16),
@@ -1817,7 +2019,7 @@ class GDNAttentionTest(parameterized.TestCase):
                     ),
                     seq_lens=jnp.array(
                         [10] * num_decodes
-                        + [prefill_len + 10]
+                        + ([prefill_len + 10] if prefill_len > 0 else [])
                         + [0] * (num_seqs - active_seqs),
                         dtype=jnp.int32,
                     ),
@@ -1831,30 +2033,27 @@ class GDNAttentionTest(parameterized.TestCase):
                     states=(init_conv, init_rec),
                     **common_kwargs,
                 )
-                with mock.patch.object(envs, "TPU_ENABLE_GDN_DYNAMIC_TILING", True):
-                    # Fresh jit: the shared jitted wrapper caches by static
-                    # args and shapes, not by the flag it reads at trace time.
-                    fn_dyn = jax.jit(
-                        wrapper.fused_conv1d_gdn.__wrapped__,
-                        static_argnames=[
-                            "n_kq",
-                            "n_v",
-                            "d_k",
-                            "d_v",
-                            "kernel_size",
-                            "num_spec_tokens",
-                        ],
-                    )
-                    (conv_out, rec_out), out = fn_dyn(
-                        states=(init_conv.copy(), init_rec.copy()),
-                        read_offsets=(
-                            jnp.zeros((num_seqs,), dtype=jnp.int32)
-                            if num_spec_tokens > 0
-                            else None
-                        ),
-                        num_spec_tokens=num_spec_tokens,
-                        **common_kwargs,
-                    )
+                fn_dyn = jax.jit(
+                    wrapper.fused_conv1d_gdn.__wrapped__,
+                    static_argnames=[
+                        "n_kq",
+                        "n_v",
+                        "d_k",
+                        "d_v",
+                        "kernel_size",
+                        "num_spec_tokens",
+                    ],
+                )
+                (conv_out, rec_out), out = fn_dyn(
+                    states=(init_conv.copy(), init_rec.copy()),
+                    read_offsets=(
+                        jnp.zeros((num_seqs,), dtype=jnp.int32)
+                        if num_spec_tokens > 0
+                        else None
+                    ),
+                    num_spec_tokens=num_spec_tokens,
+                    **common_kwargs,
+                )
                 np.testing.assert_allclose(out, out_ref, rtol=2e-2, atol=2e-2)
                 for s in range(active_seqs):
                     slot = int(state_indices[s])
