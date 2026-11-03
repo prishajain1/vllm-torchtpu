@@ -131,6 +131,22 @@ class TestBootstrapUnits(unittest.TestCase):
                 True,
             ),
             (
+                {"CI_RUN_TPU": "1"},
+                "pre-merge",
+                (6, "pre-merge"),
+                True,
+            ),
+            (
+                {
+                    "BUILDKITE_MERGE_QUEUE_BASE_BRANCH": "main",
+                    "BUILDKITE_PULL_REQUEST": "123",
+                    "BUILDKITE_PULL_REQUEST_LABELS": "oncall-fix",
+                },
+                "post-merge",
+                (11, "post-merge"),
+                True,
+            ),
+            (
                 {"BUILDKITE_BRANCH": "main", "BUILDKITE_SOURCE": "webhook"},
                 "post-merge",
                 (11, "post-merge"),
@@ -221,15 +237,42 @@ class TestBootstrapUnits(unittest.TestCase):
             ),
             "perf",
         )
-        # Branch 2: vllm-torchtpu-integration pipeline.
+        # Branch 2: /ci precheck.
+        self.assertEqual(bp.choose_suite(ctx({"CI_PRECHECK": "1"})), "cpu-only")
+        # Branch 3: vllm-torchtpu-integration pipeline.
         self.assertEqual(
             bp.choose_suite(
                 ctx({"BUILDKITE_PIPELINE_SLUG": "vllm-torchtpu-integration"})
             ),
             "integration",
         )
-        # Branch 3: skip-tpu-ci (PR label or post-merge merged_labels)
-        # beats run-full-ci and run-perf-eval.
+        # Branch 4: merge queue (releases/*, precheck-only, extras, default).
+        self.assertEqual(
+            bp.choose_suite(
+                ctx({"BUILDKITE_MERGE_QUEUE_BASE_BRANCH": "releases/v0.8"}),
+                mq_extras=("precheck-only",),
+            ),
+            "full",
+        )
+        self.assertEqual(
+            bp.choose_suite(
+                ctx({"BUILDKITE_MERGE_QUEUE_BASE_BRANCH": "main"}),
+                mq_extras=("precheck-only",),
+            ),
+            "cpu-only",
+        )
+        self.assertEqual(
+            bp.choose_suite(
+                ctx({"BUILDKITE_MERGE_QUEUE_BASE_BRANCH": "main"}),
+                mq_extras=("perf-eval",),
+            ),
+            "full",
+        )
+        self.assertEqual(
+            bp.choose_suite(ctx({"BUILDKITE_MERGE_QUEUE_BASE_BRANCH": "main"})),
+            "default",
+        )
+        # Branch 5: skip-tpu-ci or CI_PR_TPU_OPT_IN (unless CI_RUN_TPU=1).
         self.assertEqual(
             bp.choose_suite(
                 ctx(
@@ -250,7 +293,25 @@ class TestBootstrapUnits(unittest.TestCase):
             ),
             "cpu-only",
         )
-        # Branch 4: NIGHTLY=1, run-full-ci, or run-perf-eval -> "full".
+        self.assertEqual(
+            bp.choose_suite(
+                ctx({"BUILDKITE_PULL_REQUEST": "10", "CI_PR_TPU_OPT_IN": "1"})
+            ),
+            "cpu-only",
+        )
+        self.assertEqual(
+            bp.choose_suite(
+                ctx(
+                    {
+                        "BUILDKITE_PULL_REQUEST": "10",
+                        "CI_PR_TPU_OPT_IN": "1",
+                        "CI_RUN_TPU": "1",
+                    }
+                )
+            ),
+            "default",
+        )
+        # Branch 6: NIGHTLY=1, run-full-ci, run-perf-eval, or CI_EXTRAS -> "full".
         for full_env in (
             {"NIGHTLY": "1"},
             {
@@ -261,9 +322,11 @@ class TestBootstrapUnits(unittest.TestCase):
                 "BUILDKITE_PULL_REQUEST": "10",
                 "BUILDKITE_PULL_REQUEST_LABELS": "ready,run-perf-eval",
             },
+            {"CI_RUN_TPU": "1", "CI_EXTRAS": "perf-eval"},
+            {"CI_RUN_TPU": "1", "CI_EXTRAS": "nightly-suite"},
         ):
             self.assertEqual(bp.choose_suite(ctx(full_env)), "full")
-        # Branch 5: default for vllm-torchtpu-ci, torchtpu-nightly, main, unknown slug.
+        # Branch 7: default for vllm-torchtpu-ci, torchtpu-nightly, main, unknown slug.
         for default_env in (
             {"BUILDKITE_PIPELINE_SLUG": "vllm-torchtpu-ci"},
             {
@@ -330,13 +393,36 @@ class TestBootstrapUnits(unittest.TestCase):
                     (_REPO_ROOT / f".buildkite/pipeline_{lane}.yml").is_file()
                 )
 
-    def test_github_labels_resilience(self) -> None:
+    def test_github_labels_and_merge_queue_extras_resilience(self) -> None:
         bp = self.bp
         seen_auth: list[str | None] = []
 
         class AuthHandler(http.server.BaseHTTPRequestHandler):
             def do_GET(self) -> None:  # noqa: N802
                 seen_auth.append(self.headers.get("Authorization"))
+                if "/comments" in self.path:
+                    if self.headers.get("Authorization"):
+                        self.send_response(403)
+                        self.end_headers()
+                        return
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    payload = [
+                        {
+                            "user": {"type": "User"},
+                            "body": "<!-- ci-merge-extras: nightly-suite -->",
+                        },
+                        {
+                            "user": {"type": "Bot"},
+                            "body": (
+                                "Queued\n<!-- ci-merge-actor: bob -->\n"
+                                "<!-- ci-merge-extras: perf-eval -->"
+                            ),
+                        },
+                    ]
+                    self.wfile.write(json.dumps(payload).encode("utf-8"))
+                    return
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
@@ -363,6 +449,10 @@ class TestBootstrapUnits(unittest.TestCase):
                     mock.patch.object(bp, "_CREDENTIAL_HELPER", helper),
                 ):
                     self.assertEqual(bp._github_labels("42", env={}), ("skip-tpu-ci",))
+                    self.assertEqual(
+                        bp._merge_queue_pr_extras("42", env={}),
+                        (("perf-eval",), "bob", None),
+                    )
                 with (
                     mock.patch.object(bp, "_GITHUB_API_URL", api_url),
                     mock.patch.object(
@@ -374,7 +464,7 @@ class TestBootstrapUnits(unittest.TestCase):
                 server.shutdown()
                 server.server_close()
 
-            self.assertEqual(seen_auth, ["token ghs_tok", None])
+            self.assertEqual(seen_auth, ["token ghs_tok", "token ghs_tok", None, None])
 
             with (
                 mock.patch.object(bp, "_CREDENTIAL_HELPER", tmp_path / "missing"),
@@ -633,9 +723,11 @@ class TestBootstrapUnits(unittest.TestCase):
                 self,
                 files: list[str] | None = None,
                 labels: tuple[str, ...] = (),
+                mq_marker: tuple[tuple[str, ...], str, str | None] = ((), "", None),
             ) -> None:
                 self.files = ["src/vllm_torchtpu/envs.py"] if files is None else files
                 self.labels = labels
+                self.mq_marker = mq_marker
                 self.meta: list[tuple[str, str]] = []
                 self.annotations: list[str] = []
                 self.uploads: list[tuple[str, str, dict[str, str]]] = []
@@ -693,17 +785,26 @@ class TestBootstrapUnits(unittest.TestCase):
             ) -> tuple[str, ...]:
                 return self.labels
 
+            def merge_queue_pr_extras(
+                self, pr_number: str, *, env: Mapping[str, str] | None = None
+            ) -> tuple[tuple[str, ...], str, str | None]:
+                return self.mq_marker
+
         def run(
             env: dict[str, str],
             *,
             files: list[str] | None = None,
             labels: tuple[str, ...] = (),
+            mq_marker: tuple[tuple[str, ...], str, str | None] = ((), "", None),
         ) -> RunRecorder:
-            rec = RunRecorder(files=files, labels=labels)
+            rec = RunRecorder(files=files, labels=labels, mq_marker=mq_marker)
             with (
                 mock.patch.object(bp, "_agent", side_effect=rec.agent),
                 mock.patch.object(bp, "_git", side_effect=rec.git),
                 mock.patch.object(bp, "_github_labels", side_effect=rec.github_labels),
+                mock.patch.object(
+                    bp, "_merge_queue_pr_extras", side_effect=rec.merge_queue_pr_extras
+                ),
             ):
                 self.assertEqual(bp.run_bootstrap(env, repo_root=_REPO_ROOT), 0)
             return rec
@@ -968,6 +1069,115 @@ class TestBootstrapUnits(unittest.TestCase):
         self.assertEqual(
             run({"BUILDKITE_PULL_REQUEST": "42"}, files=["README.md"]).uploads, []
         )
+
+        # /ci opt-in, /ci run + CI_EXTRAS, /ci precheck, and merge-queue builds.
+        opt_in = run({"BUILDKITE_PULL_REQUEST": "12", "CI_PR_TPU_OPT_IN": "1"})
+        self.assertEqual([u[0] for u in opt_in.uploads], ["cpu", "build"])
+        self.assertEqual(opt_in.annotations, ["pr-tpu-opt-in"])
+        self.assertTrue(bool(opt_in.uploads[1][2]["OMNI_IMAGE_SKIP"]))
+        self.assertLessEqual(len(opt_in.uploads[1][2]["OMNI_IMAGE_SKIP"]), 70)
+
+        ci_run = run(
+            {
+                "BUILDKITE_PULL_REQUEST": "12",
+                "BUILDKITE_BUILD_AUTHOR_EMAIL": "Alice@Example.com",
+                "CI_PR_TPU_OPT_IN": "1",
+                "CI_RUN_TPU": "1",
+                "CI_EXTRAS": "perf-eval",
+            }
+        )
+        self.assertEqual(
+            [u[0] for u in ci_run.uploads],
+            ["upload_phase_1", "cpu", "build"],
+        )
+        self.assertEqual(ci_run.annotations, ["perf-eval"])
+        ci_run_phase2 = run_next_phase(ci_run)
+        self.assertEqual(
+            [u[0] for u in ci_run_phase2.uploads],
+            ["verify", "perf", "integration", "tests"],
+        )
+        self.assertIn("tpu-pr/alice@example.com", ci_run_phase2.uploads[3][1])
+
+        with self.assertRaisesRegex(bp.BootstrapError, "CI_EXTRAS names 'bogus'"):
+            run({"CI_RUN_TPU": "1", "CI_EXTRAS": "bogus"})
+
+        pre = run(
+            {
+                "CI_PRECHECK": "1",
+                "CI_RUN_TPU": "1",
+                "BUILDKITE_MESSAGE": "docs [skip ci]",
+            },
+            files=["README.md"],
+        )
+        self.assertIn(("JOB_PRIORITY", "6"), pre.meta)
+        self.assertEqual(pre.annotations, ["ci-precheck"])
+        self.assertEqual([u[0] for u in pre.uploads], ["cpu", "build"])
+        self.assertTrue(bool(pre.uploads[1][2]["OMNI_IMAGE_SKIP"]))
+
+        mq_main = run(
+            {
+                "BUILDKITE_BRANCH": "gh-readonly-queue/main/pr-42-deadbeef",
+                "BUILDKITE_MERGE_QUEUE_BASE_BRANCH": "main",
+                "BUILDKITE_PULL_REQUEST": "42",
+                "BUILDKITE_PULL_REQUEST_LABELS": "skip-tpu-ci,oncall-fix",
+                "BUILDKITE_BUILD_AUTHOR_EMAIL": "Alice@Example.com",
+                "BUILDKITE_MESSAGE": "feat: x [skip ci]",
+                "CI_PR_TPU_OPT_IN": "1",
+            }
+        )
+        self.assertIn(("JOB_PRIORITY", "11"), mq_main.meta)
+        self.assertIn(("WORKLOAD_PRIORITY", "post-merge"), mq_main.meta)
+        self.assertEqual(mq_main.annotations, [])
+        self.assertEqual(
+            [u[0] for u in mq_main.uploads],
+            ["upload_phase_1", "cpu", "build"],
+        )
+        mq_main_phase2 = run_next_phase(mq_main)
+        self.assertEqual(
+            [u[0] for u in mq_main_phase2.uploads],
+            ["verify", "integration", "tests"],
+        )
+        self.assertNotIn("tpu-pr/", mq_main_phase2.uploads[2][1])
+
+        mq_rel = run(
+            {
+                "BUILDKITE_BRANCH": "gh-readonly-queue/releases/v0.8/pr-42-deadbeef",
+                "BUILDKITE_MERGE_QUEUE_BASE_BRANCH": "releases/v0.8",
+            },
+            mq_marker=(("precheck-only",), "alice", None),
+        )
+        self.assertEqual(mq_rel.annotations, ["full-ci"])
+        mq_rel_phase2 = run_next_phase(mq_rel)
+        self.assertIn("perf", [u[0] for u in mq_rel_phase2.uploads])
+
+        mq_pre = run(
+            {
+                "BUILDKITE_BRANCH": "gh-readonly-queue/main/pr-42-deadbeef",
+                "BUILDKITE_MERGE_QUEUE_BASE_BRANCH": "main",
+            },
+            mq_marker=(("precheck-only",), "alice", None),
+        )
+        self.assertEqual(mq_pre.annotations, ["ci-merge-precheck-only"])
+        self.assertEqual([u[0] for u in mq_pre.uploads], ["cpu", "build"])
+
+        mq_warn = run(
+            {
+                "BUILDKITE_BRANCH": "gh-readonly-queue/main/pr-42-deadbeef",
+                "BUILDKITE_MERGE_QUEUE_BASE_BRANCH": "main",
+            },
+            mq_marker=((), "", "HTTP 500"),
+        )
+        self.assertEqual(mq_warn.annotations, ["ci-merge-extras"])
+
+        mq_docs = run(
+            {
+                "BUILDKITE_BRANCH": "gh-readonly-queue/main/pr-42-deadbeef",
+                "BUILDKITE_MERGE_QUEUE_BASE_BRANCH": "main",
+            },
+            files=["README.md"],
+        )
+        self.assertEqual(mq_docs.annotations, ["docs-only"])
+        self.assertEqual(mq_docs.uploads, [])
 
         # Validate raw fragments, combined rendered pipelines (in Buildkite display
         # order: reversed(uploads)), and nightly_report.sh's step-key scan.
