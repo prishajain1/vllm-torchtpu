@@ -14,6 +14,7 @@
 """Core declarations, execution config, VMEM pool aliasing, and numeric primitives."""
 
 from . import (
+    advisor,
     decls,
     errors,
     exec_spec,
@@ -76,6 +77,7 @@ __all__ = [
     "Tiles",
     "VLLMAlias",
     "WeightDecl",
+    "advisor",
     "decls",
     "default_tiles",
     "encode_ecopy",
