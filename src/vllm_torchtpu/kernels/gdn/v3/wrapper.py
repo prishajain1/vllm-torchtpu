@@ -300,7 +300,7 @@ def outer_kernel(
             allocations=allocations,
         )
 
-    _run()
+    pl.when(num_tiles > 0)(_run)
 
 
 @jax.jit(
