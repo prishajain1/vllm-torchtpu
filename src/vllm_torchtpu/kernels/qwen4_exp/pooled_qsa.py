@@ -2,6 +2,7 @@
 """QSA over one donated pool, with independent group-native block tables."""
 
 import dataclasses
+import functools
 import math
 from typing import ClassVar
 
