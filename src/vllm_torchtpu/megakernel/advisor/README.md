@@ -16,11 +16,20 @@ python -m vllm_torchtpu.megakernel.advisor estimate \
 
 ### 2. Trace Calibration (`calibrate`)
 
-Extract empirical host/device launch gaps, collective hop latencies, and fused-eligible step coverage into an `advisor.measurements.v1` JSON file.
+Extract empirical host/device launch gaps, collective hop latencies, and fused-eligible step coverage into an `advisor.measurements.v1` JSON file from an XPlane profile directory or Perfetto JSON trace:
+
+```bash
+python examples/tpu_profiling.py \
+  --model Qwen/Qwen3-30B-A3B-FP8 --tensor-parallel-size 8 \
+  --enable-expert-parallel --profile-dir /tmp/tpu_profile
+python -m vllm_torchtpu.megakernel.advisor calibrate \
+  --trace /tmp/tpu_profile --chip tpu7x --model Qwen/Qwen3-30B-A3B-FP8 \
+  --out measurements.json
+```
 
 ### 3. Calibrated Evaluation (`--measurements`)
 
-Re-run with `--measurements measurements.json` to promote `ASSUMED` inputs to `MEASURED` and settle `tie(measure: <input>)` verdicts:
+Re-run with `--measurements measurements.json` (or load bundled public priors via `chips.load_public_calibration("tpu7x")`) to promote `ASSUMED` inputs to `MEASURED` and settle `tie(measure: <input>)` verdicts:
 
 ```bash
 python -m vllm_torchtpu.megakernel.advisor estimate \

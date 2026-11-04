@@ -31,6 +31,7 @@ _USABLE_VMEM_RESERVE_BYTES = 2 << 20
 _DEFAULT_ROW_TILE_FP8 = 32
 _DEFAULT_ROW_TILE_WIDE = 16
 _DEFAULT_ROW_TILE_NARROW = 8
+_CALIBRATION_DIR = Path(__file__).resolve().parent / "data" / "calibration"
 
 REQUIRED_CHIP_SPEC_KEYS: tuple[str, ...] = (
     "vmem_capacity_bytes",
@@ -430,3 +431,22 @@ def verify_chip_spec_against_jax(spec: ChipSpec) -> list[str]:
         if actual != expected:
             mismatches.append(f"{spec.name}.{field_name}: {actual} != {expected}")
     return mismatches
+
+
+def public_calibration_path(chip_name: str = "tpu7x") -> Path | None:
+    """Return path to the bundled public calibration JSON for `chip_name` if present."""
+    raw = chip_name.strip().lower().removeprefix("tpu_").removesuffix("_megacore")
+    canon = "tpu7x" if raw in ("7x", "v7x", "tpu7x") else raw
+    candidate = _CALIBRATION_DIR / f"{canon}_public.json"
+    return candidate if candidate.is_file() else None
+
+
+def load_public_calibration(chip_name: str = "tpu7x") -> dict[str, object] | None:
+    """Load the bundled public calibration JSON for `chip_name` when available."""
+    cal_path = public_calibration_path(chip_name)
+    if cal_path is None:
+        return None
+    loaded = json.loads(cal_path.read_text(encoding="utf-8"))
+    if type(loaded) is not dict:
+        return None
+    return {str(k): v for k, v in loaded.items()}
