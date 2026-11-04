@@ -16,19 +16,31 @@
 from __future__ import annotations
 
 import importlib
-from dataclasses import asdict, dataclass, replace
+import json
+from dataclasses import asdict, dataclass, field, replace
 from math import ceil, gcd, log2
-from typing import TYPE_CHECKING, Literal
+from pathlib import Path
+from typing import TYPE_CHECKING, Literal, TypedDict
 
-import jax.numpy as jnp
-from jax.experimental.pallas import tpu as pltpu
-
-from vllm_torchtpu.megakernel import errors, exec_spec, ops, planner, spec
+from vllm_torchtpu.megakernel import errors
+from vllm_torchtpu.megakernel.advisor.chips import (
+    BUILTIN_CHIP_SPECS,
+    REQUIRED_CHIP_SPEC_KEYS,
+    TPU7X_TOPOLOGIES,
+    ChipSpec,
+    FieldSource,
+    load_chip_spec_file,
+    resolve_chip_spec,
+    verify_chip_spec_against_jax,
+)
 from vllm_torchtpu.megakernel.advisor.models import (
+    DEPLOYMENT_PRESET_SOURCES,
     DEPLOYMENT_PRESETS,
+    MODEL_PRESET_SOURCES,
     MODEL_PRESETS,
     REGISTERED_MODEL_ALIASES,
     SUPPORTED_MODEL_TYPES,
+    VERIFIED_MEGAKERNEL_MODEL_TYPES,
     DeploymentPreset,
     ModelProfile,
     ParallelLayout,
@@ -43,11 +55,12 @@ from vllm_torchtpu.megakernel.advisor.report import (
     render_advisor_html,
     write_advisor_html,
 )
-from vllm_torchtpu.megakernel.profiles import default as default_profiles
 
 if TYPE_CHECKING:
     import argparse
     from collections.abc import Mapping, Sequence
+
+    from vllm_torchtpu.megakernel import exec_spec, spec
 
 # Where the kernel boundary falls: one call per operator, per layer, per group
 # of N layers (a model preset or a pipeline stage), or one call per step.
@@ -57,15 +70,23 @@ FusionScope = Literal[
 Phase = Literal["decode", "verify", "prefill", "mixed"]
 # Where routed tokens are grouped by expert and where the data lives.
 MoEMode = Literal["masked_on_chip", "grouped_on_chip", "grouped_in_hbm", "dense_mlp"]
+ProvenanceTag = Literal["FACT", "DERIVED", "ASSUMED", "MEASURED"]
+ObjectiveMode = Literal["step", "throughput", "both"]
 
-FIT_VMEM_HEADROOM_MIB = 6
-_WIDE_MATMUL_COLS = 256
 _MIN_VMEM_MIB = 2
-_MEGACORE_CORES = 2
-_GROUPED_MOE_MIN_TOKENS = 32
-_MAX_RECOMMENDED_STEP_WEIGHT_GB = 45.0
+_DEFAULT_USABLE_VMEM_MIB = 62
+_DOUBLE_BUFFER_SLOTS = 2
 _VALID_DMA_BUFFERS = (2, 3)
 _GROUPED_MOE_MODES = frozenset({"grouped_on_chip"})
+_DEFAULT_LAUNCH_GAP_FLOOR_US = 1.0
+_DEFAULT_LAUNCH_GAP_VAL_US = 2.0
+_DEFAULT_LAUNCH_GAP_UPPER_US = 8.0
+_MEASUREMENTS_SCHEMA = "advisor.measurements.v1"
+
+SUPPORTED_ONCHIP_FAMILIES: frozenset[str] = frozenset(
+    {"gqa", "mla", "dsa", "swa", "gdn", "kda", "dense_mlp", "moe", "mtp", "ple"}
+)
+
 _DTYPE_BYTES: Mapping[str, float] = {
     "fp32": 4.0,
     "bf16": 2.0,
@@ -76,60 +97,142 @@ _DTYPE_BYTES: Mapping[str, float] = {
     "mxfp4": 0.53125,
     "fp4": 0.5625,
 }
-_CHIP_ICI_SPECS: Mapping[str, tuple[int, float, float]] = {
-    "v4": (1, 135.0, 45.0),
-    "v5e": (0, 200.0, 50.0),
-    "v5p": (1, 300.0, 100.0),
-    "v6e": (0, 400.0, 100.0),
-    "tpu7x": (0, 300.0, 100.0),
-}
-_TPU7X_TOPOLOGIES: Mapping[int, str] = {
-    1: "1x1x1 (1 core)",
-    2: "1x1x1 (1 chip, 2 cores)",
-    4: "1x2x1 (2 chips, 4 cores)",
-    8: "2x2x1 (4 chips, 8 cores)",
-    16: "2x2x2 (8 chips, 16 cores)",
-    32: "2x2x4 (16 chips, 32 cores)",
-    64: "2x4x4 (32 chips, 64 cores)",
-}
+
+
+class ProvenanceMetric(TypedDict):
+    """Single output metric value paired with its provenance tag, source, and band."""
+
+    value: float | int | bool
+    unit: str
+    tag: ProvenanceTag
+    source: str
+    band: list[float]
 
 
 @dataclass(frozen=True)
-class ChipSpec:
-    """Hardware ceiling parameters for one logical TPU device."""
+class RingPlan:
+    """On-chip VMEM ring-buffer slot counts and bank widths for weight streaming."""
 
-    name: str
-    cores_per_device: int
-    tpu_info: pltpu.TpuInfo
-    vmem_capacity_bytes: int
-    vmem_usable_bytes: int
-    hbm_capacity_bytes: int
-    hbm_bw_bytes_per_s: float
-    bf16_flops_per_s: float
-    native_ocp_fp8: bool
-    ici_egress_bw_bytes_per_s: float
-    ici_link_bw_bytes_per_s: float
-    collective_latency_s: float
+    dense_slots: int = 2
+    expert_slots: int = 2
+    dense_slot_bytes: int = 2 << 20
+    expert_slot_bytes: int = 2 << 20
+    compiler_spill_reserve_bytes: int = 6 << 20
 
-    def peak_flops(self, dtype: str) -> float:
-        """Return peak dense matrix FLOP/s for dtype on this logical device."""
-        dt = dtype.lower()
-        cores = self.cores_per_device
-        info = self.tpu_info
-        fp8_peak = dt in ("fp8", "nvfp4", "mxfp4", "fp4") and info.fp8_ops_per_second
-        ops_s = fp8_peak or (
-            info.int8_ops_per_second if dt == "int8" else info.bf16_ops_per_second
+
+def default_double_buffer_ring_plan(dma_buffers: int = 2) -> RingPlan:
+    """Return the default n-slot weight-streaming RingPlan."""
+    return RingPlan(dense_slots=dma_buffers, expert_slots=dma_buffers)
+
+
+@dataclass(frozen=True)
+class MeasurementsData:
+    """Calibrated runtime measurements loaded from an `advisor.measurements.v1` file."""
+
+    source_desc: str
+    launch_gap_p50_us: float | None = None
+    launch_gap_p90_us: float | None = None
+    launch_gap_n: int = 0
+    collective_hop_us: float | None = None
+    collective_n: int = 0
+    step_coverage: float | None = None
+    step_time_us: float | None = None
+    ring_plan: RingPlan | None = None
+
+
+def _parse_collectives_hop_us(coll_raw: object) -> tuple[float | None, int]:
+    """Extract minimum per-hop collective latency and count from collectives."""
+    if type(coll_raw) is not list or not coll_raw:
+        return None, 0
+    hops_list: list[float] = []
+    coll_n = 0
+    for item in coll_raw:
+        if type(item) is dict and "latency_us" in item:
+            grp = max(2, int(item.get("group_size", 2)))
+            hops = max(1, round(log2(grp)))
+            hops_list.append(float(item["latency_us"]) / hops)
+            coll_n += int(item.get("n", 1))
+    return (min(hops_list) if hops_list else None), coll_n
+
+
+def _parse_ring_plan(rp_raw: object) -> RingPlan | None:
+    """Parse an optional RingPlan mapping from measurements JSON."""
+    if type(rp_raw) is not dict:
+        return None
+    return RingPlan(
+        dense_slots=int(rp_raw.get("dense_slots", 2)),
+        expert_slots=int(rp_raw.get("expert_slots", 2)),
+        dense_slot_bytes=int(rp_raw.get("dense_slot_bytes", 2 << 20)),
+        expert_slot_bytes=int(rp_raw.get("expert_slot_bytes", 2 << 20)),
+        compiler_spill_reserve_bytes=int(
+            rp_raw.get("compiler_spill_reserve_bytes", 6 << 20)
+        ),
+    )
+
+
+def load_measurements(
+    target: object,
+) -> MeasurementsData:
+    """Load and validate an `advisor.measurements.v1` JSON file or mapping."""
+    if type(target) is MeasurementsData:
+        return target
+    if type(target) is dict:
+        payload: Mapping[str, object] = target
+        file_label = "inline_mapping"
+    else:
+        path = Path(str(target))
+        if not path.is_file():
+            msg = f"Missing measurements file: {path}"
+            raise errors.MegakernelConfigError(msg)
+        payload = json.loads(path.read_text("utf-8"))
+        file_label = path.name
+    if payload.get("schema") != _MEASUREMENTS_SCHEMA:
+        msg = (
+            f"Unsupported measurements schema {payload.get('schema')!r}; "
+            f"expected {_MEASUREMENTS_SCHEMA!r}"
         )
-        return float(ops_s) * cores * (0.5 if dt == "fp32" else 1.0)
+        raise errors.MegakernelConfigError(msg)
+    src_raw = payload.get("source")
+    src_map: Mapping[str, object] = src_raw if type(src_raw) is dict else {}
+    src_desc = f"{src_map.get('kind', 'trace')}:{src_map.get('file', file_label)}"
 
-    def lhs_row_floor(self, dtype: str) -> int:
-        """Return the minimum unpadded LHS row tile height for dtype."""
-        is_fp8 = (
-            dtype.lower() in ("fp8", "nvfp4", "mxfp4", "fp4") and self.native_ocp_fp8
-        )
-        if is_fp8:
-            return _GROUPED_MOE_MIN_TOKENS
-        return 16 if self.tpu_info.mxu_column_size >= _WIDE_MATMUL_COLS else 8
+    lg_raw = payload.get("launch_gap_us")
+    lg_map: Mapping[str, object] = lg_raw if type(lg_raw) is dict else {}
+    lg_p50 = float(str(lg_map["p50"])) if "p50" in lg_map else None
+    lg_p90 = (
+        float(str(lg_map.get("p90", lg_p50 or 0.0))) if lg_p50 is not None else None
+    )
+    lg_n = int(str(lg_map.get("n", 0))) if lg_p50 is not None else 0
+
+    coll_hop, coll_n = _parse_collectives_hop_us(payload.get("collectives"))
+
+    cov_raw = payload.get("step_coverage")
+    cov_map: Mapping[str, object] = cov_raw if type(cov_raw) is dict else {}
+    cov_val = (
+        float(str(cov_map["fused_eligible_fraction"]))
+        if "fused_eligible_fraction" in cov_map
+        else None
+    )
+
+    st_raw = payload.get("step_time_us")
+    st_map: Mapping[str, object] = st_raw if type(st_raw) is dict else {}
+    st_val = (
+        float(str(st_map["p50"]))
+        if "p50" in st_map
+        else (float(str(st_raw)) if type(st_raw) in (int, float) else None)
+    )
+
+    return MeasurementsData(
+        source_desc=src_desc,
+        launch_gap_p50_us=lg_p50,
+        launch_gap_p90_us=lg_p90,
+        launch_gap_n=lg_n,
+        collective_hop_us=coll_hop,
+        collective_n=coll_n,
+        step_coverage=cov_val,
+        step_time_us=st_val,
+        ring_plan=_parse_ring_plan(payload.get("ring_plan")),
+    )
 
 
 @dataclass(frozen=True)
@@ -163,6 +266,8 @@ class WorkloadSpec:
     op_overhead_us: float = 0.0
     vmem_budget_mib: float | None = None
     dma_buffers: int = 2
+    ring_plan: RingPlan | None = None
+    objective: ObjectiveMode = "step"
 
 
 @dataclass(frozen=True)
@@ -183,6 +288,7 @@ class ScopeEstimate:
     roof_floor_us: float
     step_bound_us: float
     break_even_op_overhead_us: float = 0.0
+    step_upper_us: float = 0.0
 
     @property
     def max_vmem_tokens(self) -> int:
@@ -219,6 +325,11 @@ class AdvisorReport:
     ridge_tokens: int = 0
     recommended_moe_mode: str = "dense_mlp"
     dma_buffers: int = 2
+    verdict: str = "separate_likely"
+    confidence: str = "prior_only"
+    flags: tuple[str, ...] = ()
+    metrics: dict[str, ProvenanceMetric] = field(default_factory=dict)
+    unresolved_assumptions: tuple[dict[str, object], ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         """Serialize AdvisorReport to a JSON-compatible dictionary."""
@@ -267,6 +378,12 @@ class RegimeEntry:
     step_bound_us: float
     rationale: str
     layout: str = ""
+    step_upper_us: float = 0.0
+    verdict: str = "separate_likely"
+    confidence: str = "prior_only"
+    flags: tuple[str, ...] = ()
+    metrics: dict[str, ProvenanceMetric] = field(default_factory=dict)
+    unresolved_assumptions: tuple[dict[str, object], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -294,63 +411,14 @@ class AdvisorSweepReport:
         return asdict(self)
 
 
-def fit_vmem_budget_bytes(tiles: exec_spec.Tiles | None = None) -> int:
-    """Return usable VMEM budget bytes after applying the 6 MiB compiler headroom."""
-    target_tiles = tiles or default_profiles.TPU_V7X
-    return max(0, target_tiles.vmem_mib - FIT_VMEM_HEADROOM_MIB) << 20
-
-
-def resolve_chip_spec(
-    chip: ChipSpec | str = "tpu7x",
-    *,
-    megacore: bool = False,
-    ici_bw_gbps: float | None = None,
-    collective_latency_us: float | None = None,
-) -> ChipSpec:
-    """Resolve hardware ceiling parameters from JAX Pallas tpu_info."""
-    if isinstance(chip, ChipSpec):
-        return chip
-    raw = str(chip).strip().lower().removeprefix("tpu_")
-    info = None
-    if raw == "auto":
-        try:
-            info = pltpu.get_tpu_info()
-            raw = info.chip_version.value.lower()
-        except Exception as exc:
-            msg = "chip='auto' requires TPU"
-            raise errors.MegakernelConfigError(msg) from exc
-    num_cores = int(info.num_cores) if info is not None else 1 + int(megacore)
-    canon = "tpu7x" if raw in ("7x", "v7x", "tpu7x") else raw
-    if canon not in _CHIP_ICI_SPECS or (megacore and not _CHIP_ICI_SPECS[canon][0]):
-        msg = f"Invalid chip={chip!r} or Megacore"
-        raise errors.MegakernelConfigError(msg)
-    _, egress_gbps, link_gbps = _CHIP_ICI_SPECS[canon]
-    chip_ver = pltpu.ChipVersion(canon.removeprefix("tpu"))
-    tpu_info = info or pltpu.get_tpu_info_for_chip(chip_ver, num_cores)
-    vmem_cap = int(tpu_info.vmem_capacity_bytes) * num_cores
-    hbm_cap = int(tpu_info.hbm_capacity_bytes) * num_cores
-    return ChipSpec(
-        name=f"{canon}_megacore" if num_cores == _MEGACORE_CORES else canon,
-        cores_per_device=num_cores,
-        tpu_info=tpu_info,
-        vmem_capacity_bytes=vmem_cap,
-        vmem_usable_bytes=vmem_cap - (2 << 20),
-        hbm_capacity_bytes=hbm_cap,
-        hbm_bw_bytes_per_s=float(tpu_info.mem_bw_bytes_per_second) * num_cores,
-        bf16_flops_per_s=float(tpu_info.bf16_ops_per_second) * num_cores,
-        native_ocp_fp8=bool(
-            tpu_info.is_matmul_supported(jnp.float8_e4m3fn, jnp.float8_e4m3fn)
-        ),
-        ici_egress_bw_bytes_per_s=(
-            egress_gbps * num_cores if ici_bw_gbps is None else ici_bw_gbps
-        )
-        * 1e9,
-        ici_link_bw_bytes_per_s=link_gbps * 1e9,
-        collective_latency_s=(
-            1.0 if collective_latency_us is None else collective_latency_us
-        )
-        * 1e-6,
-    )
+def fit_vmem_budget_bytes(
+    tiles: exec_spec.Tiles | None = None,
+    ring_plan: RingPlan | None = None,
+) -> int:
+    """Return usable VMEM budget bytes after subtracting the RingPlan spill reserve."""
+    rp = ring_plan or default_double_buffer_ring_plan()
+    vmem_mib = tiles.vmem_mib if tiles is not None else _DEFAULT_USABLE_VMEM_MIB
+    return max(0, (vmem_mib << 20) - rp.compiler_spill_reserve_bytes)
 
 
 def compute_per_token_vmem_bytes(
@@ -358,7 +426,7 @@ def compute_per_token_vmem_bytes(
 ) -> dict[str, int]:
     """Compute per-token live VMEM bytes from tensor lifetimes and TP/EP sharding."""
     hidden = profile.hidden_size
-    tp = max(1, workload.tp)
+    tp = max(1, workload.tp, workload.dcp if workload.tp == 1 else workload.tp)
     ep = max(1, workload.ep)
     kv_split = max(1, workload.kv_split, workload.dcp)
 
@@ -401,9 +469,13 @@ def compute_per_token_vmem_bytes(
         router_scratch_bytes = 4 * profile.num_experts + 8 * profile.top_k
         is_grouped = workload.moe_mode in _GROUPED_MOE_MODES
         if is_grouped:
+            # Streaming grouped MoE holds active expert FFN intermediates in fixed
+            # tile scratch; at most _DOUBLE_BUFFER_SLOTS * ep streamed expert slices
+            # (or 1 on single-rank EP=1) are live per token at once.
+            eff_top_k = min(profile.top_k, _DOUBLE_BUFFER_SLOTS * ep) if ep > 1 else 1
             expert_tile_bytes = (
                 8 * expert_hidden
-                + ceil(profile.top_k * (6 * expert_hidden + 8 * inter_local) / ep)
+                + ceil(eff_top_k * (6 * expert_hidden + 8 * inter_local) / ep)
                 + 8 * shared_local
             )
         else:
@@ -444,6 +516,7 @@ def _validate_advise_inputs(
     num_layers = profile.num_layers
     tp, pp, dp, ep = workload.tp, workload.pp, workload.dp, workload.ep
     kv_split, dcp, pcp = workload.kv_split, workload.dcp, workload.pcp
+    eff_tp = max(tp, dcp) if tp == 1 else tp
     pos_fields = (
         num_layers,
         profile.hidden_size,
@@ -494,9 +567,9 @@ def _validate_advise_inputs(
         raise errors.MegakernelConfigError(msg)
     parallel_ok = (
         min(*nonneg_fields) >= 0
-        and (tp * dp * pcp) % ep == 0
-        and tp % kv_split == 0
-        and tp % dcp == 0
+        and (eff_tp * dp * pcp) % ep == 0
+        and eff_tp % kv_split == 0
+        and eff_tp % dcp == 0
         and pp <= num_layers
     )
     expert_ok = (
@@ -568,7 +641,10 @@ def _scope_vmem_and_ops(
             )
     elif scope in ("whole_step", "whole_step_repass") and no_whole_step:
         feasible = False
-        reason = plan_error or "Bounded by layer groups, single layers, or non-periodic"
+        reason = (
+            plan_error
+            or "Bounded by layer groups, single layers, or unmodeled layer family"
+        )
 
     if scope == "per_op":
         static_vmem_bytes = max(1 << 20, single_layer_dense_staging)
@@ -580,8 +656,6 @@ def _scope_vmem_and_ops(
         return static_vmem_bytes, act_bytes, n_ops, t_max, n_splits, feasible, reason
 
     is_single_layer = scope == "single_layer"
-    # Multi-layer calls per step for layer_group: the preset's groups (one call
-    # each) or the pipeline-stage segments; whole_step is one call.
     mul = (preset_groups or num_segments) if scope == "layer_group" else 1
     dense_staging_bytes = (
         single_layer_dense_staging if is_single_layer else whole_step_dense_staging
@@ -620,7 +694,7 @@ def _scope_vmem_and_ops(
         if is_single_layer
         else mul
         if scope == "layer_group" and preset_groups
-        else (mul * (3 if workload.tp * workload.ep > 1 and l_attn + l_lin else 1))
+        else (mul * (3 if ctx.eff_tp * workload.ep > 1 and l_attn + l_lin else 1))
     )
     alpha = per_token_fused_bytes
     t_max = (
@@ -636,6 +710,14 @@ def _scope_vmem_and_ops(
     return static_vmem_bytes, act_bytes, n_ops, t_max, n_splits, feasible, reason
 
 
+def _experts_hit(
+    tokens_ep: int, top_k: int, num_experts: int, experts_local: int
+) -> float:
+    """Return expected distinct local experts hit by `tokens_ep` tokens."""
+    miss = (1.0 - min(1.0, top_k / num_experts)) ** tokens_ep
+    return max(1.0, experts_local * (1.0 - miss))
+
+
 def _moe_weights_and_padding(
     ctx: _ScopeContext,
     profile: ModelProfile,
@@ -649,23 +731,25 @@ def _moe_weights_and_padding(
     if experts_local == 0:
         return ctx.w_static, 1.0
 
-    def experts_hit(tokens_ep: int) -> float:
-        """Return expected distinct local experts hit by `tokens_ep` tokens."""
-        miss = (1.0 - min(1.0, profile.top_k / profile.num_experts)) ** tokens_ep
-        return max(1.0, experts_local * (1.0 - miss))
-
     t_ep = tile_tokens * ep_dp
-    e_hit = experts_hit(t_ep)
+    e_hit = _experts_hit(t_ep, profile.top_k, profile.num_experts, experts_local)
     pairs = max(1.0, t_ep * profile.top_k * experts_local / profile.num_experts)
     avg_m = max(1.0, pairs / e_hit)
-    # Tiled scopes stream each hit expert once for all tiles of the step.
-    hit = experts_hit(ctx.active_tokens * ep_dp) if tiled else e_hit
+    hit = (
+        _experts_hit(
+            ctx.active_tokens * ep_dp,
+            profile.top_k,
+            profile.num_experts,
+            experts_local,
+        )
+        if tiled
+        else e_hit
+    )
     w_step = ctx.w_static + ctx.l_moe * hit * ctx.exp_bytes
-    # Price the MoE mode advise() recommends: on-chip grouping once a tile gives
-    # each EP rank a full row tile (rec_moe in advise()).
-    if grouped or t_ep >= _GROUPED_MOE_MIN_TOKENS:
+    if grouped or t_ep >= ctx.row_floor:
         return w_step, ceil(avg_m / ctx.row_floor) * ctx.row_floor / avg_m
-    return w_step, max(1.0, (ops.rup(t_ep, 16) * e_hit) / pairs)
+    rup_16 = ((t_ep + 15) // 16) * 16
+    return w_step, max(1.0, (rup_16 * e_hit) / pairs)
 
 
 def _evaluate_scopes(
@@ -673,34 +757,19 @@ def _evaluate_scopes(
     profile: ModelProfile,
     workload: WorkloadSpec,
 ) -> tuple[list[ScopeEstimate], dict[FusionScope, float]]:
-    """Evaluate every FusionScope against VMEM, HBM, and matmul bounds.
-
-    Overflow past the VMEM token ceiling (`n_splits > 1`) is priced two ways:
-    whole_step and layer_group tile tokens inside each layer while that
-    layer's weights stay resident (weights read once per step, plus residual
-    spill and per-tile fill/drain); whole_step_repass and single_layer re-run
-    the call per token pass and re-read weights each pass.
-    """
-    layers_local, l_moe = ctx.layers_local, ctx.l_moe
-    active_tokens = ctx.active_tokens
-    token_residual_bytes = ctx.token_residual_bytes
-    ep_dp = ctx.ep_dp
-    num_ar, ar_hops = ctx.num_ar, ctx.ar_hops
-    ar_vol, egress_bw, lat_coll = (
-        ctx.ar_vol,
-        ctx.egress_bw,
-        ctx.lat_coll,
-    )
+    """Evaluate every FusionScope against VMEM, HBM, and matmul bounds."""
+    layers_local, l_moe, active_tokens = ctx.layers_local, ctx.l_moe, ctx.active_tokens
+    token_residual_bytes, ep_dp = ctx.token_residual_bytes, ctx.ep_dp
+    num_ar, ar_hops, ar_vol = ctx.num_ar, ctx.ar_hops, ctx.ar_vol
+    egress_bw, lat_coll = ctx.egress_bw, ctx.lat_coll
     pp_stage_time, a2a_time = ctx.pp_stage_time, ctx.a2a_time
     flops_dense, flops_moe = ctx.flops_dense, ctx.flops_moe
-    peak_w, peak_e, bw_hbm = (
-        ctx.peak_w,
-        ctx.peak_e,
-        ctx.bw_hbm,
+    peak_w, peak_e, bw_hbm = ctx.peak_w, ctx.peak_e, ctx.bw_hbm
+    kv_cache_read_bytes, recurrent_state_rw_bytes, first_slot_bytes = (
+        ctx.kv_cache_read_bytes,
+        ctx.recurrent_state_rw_bytes,
+        ctx.first_slot_bytes,
     )
-    kv_cache_read_bytes = ctx.kv_cache_read_bytes
-    recurrent_state_rw_bytes = ctx.recurrent_state_rw_bytes
-    first_slot_bytes = ctx.first_slot_bytes
 
     estimates: list[ScopeEstimate] = []
     raw_step_map: dict[FusionScope, float] = {}
@@ -725,23 +794,28 @@ def _evaluate_scopes(
         ) = _scope_vmem_and_ops(scope, ctx, profile, workload)
         tiled = scope in ("whole_step", "layer_group") and n_splits > 1
         tile_tokens = ceil(active_tokens / max(1, n_splits))
+        grouped_moe = scope == "per_op" or workload.moe_mode in _GROUPED_MOE_MODES
+        # In grouped MoE on whole_step/layer_group/per_op, token-expert sorting
+        # spans the active call batch rather than a single VMEM sub-tile.
+        moe_tokens = (
+            active_tokens
+            if grouped_moe and scope not in ("single_layer", "whole_step_repass")
+            else tile_tokens
+        )
         w_step, phi = _moe_weights_and_padding(
             ctx,
             profile,
-            tile_tokens,
+            moe_tokens,
             tiled=tiled,
-            grouped=scope == "per_op" or workload.moe_mode in _GROUPED_MOE_MODES,
+            grouped=grouped_moe,
         )
         if tiled:
-            # Residual of tokens outside the active tile round-trips HBM per layer.
             act_bytes += 2.0 * layers_local * token_residual_bytes
 
-        # Out-of-kernel XLA collectives (per_op) execute 2-phase RS + AG on HBM
-        # buffers, whereas in-kernel megakernel collectives push directly VMEM->VMEM.
-        xla_ar_factor = 2 if scope == "per_op" and workload.tp > 1 else 1
+        xla_ar_factor = 2 if scope == "per_op" and ctx.eff_tp > 1 else 1
         xla_hbm_coll_bytes = (
             2.0 * num_ar * token_residual_bytes
-            if scope == "per_op" and workload.tp > 1
+            if scope == "per_op" and ctx.eff_tp > 1
             else 0.0
         )
         t_comm = (
@@ -755,16 +829,11 @@ def _evaluate_scopes(
                 else 0.0
             )
         )
-        # Pallas pipeline prologue fill + epilogue drain per separate kernel launch:
-        # whole_step pays once/step; single_layer/per_op pay at each HLO boundary.
-        # dma_buffers only sizes VMEM staging; state streams are priced at full bytes.
         eff_state_bytes = kv_cache_read_bytes + recurrent_state_rw_bytes
         pipeline_fill_drain_s = (n_ops - 1) * (
             first_slot_bytes / bw_hbm + 2.0 * lat_coll
         )
         if tiled:
-            # Each extra tile restarts the per-layer pipeline: its residual tile
-            # loads before compute starts, plus the begin/end semaphore syncs.
             tile_residual_bytes = tile_tokens * profile.hidden_size * 2.0
             pipeline_fill_drain_s += (
                 (n_splits - 1)
@@ -772,6 +841,13 @@ def _evaluate_scopes(
                 * (tile_residual_bytes / bw_hbm + 2.0 * lat_coll)
             )
         t_matmul = flops_dense / peak_w + (phi * flops_moe) / peak_e
+        t_matmul_upper = (
+            (flops_dense - ctx.flops_kv) / peak_w
+            + ctx.flops_kv / ctx.bf16_peak
+            + (phi * flops_moe) / peak_e
+            if workload.phase in ("prefill", "mixed") and ctx.flops_kv > 0
+            else t_matmul
+        )
         act_saved = 4.0 * layers_local * token_residual_bytes - act_bytes
         hbm_int = (1 if tiled else n_splits) * w_step + eff_state_bytes
         d_ops = sub_ops - n_ops
@@ -783,20 +859,31 @@ def _evaluate_scopes(
         base_ai = (flops_dense + flops_moe) / max(
             1.0, w_step + kv_cache_read_bytes + recurrent_state_rw_bytes
         )
-        pure_us = (
-            roof_us + (act_bytes + (n_splits - 1) * w_step) / bw_hbm * 1e6
+        repass_spill_us = (
+            (act_bytes + (n_splits - 1) * w_step) / bw_hbm * 1e6
             if base_ai >= peak_w / bw_hbm and n_splits > 1 and not tiled
-            else (
-                max(t_matmul, hbm_int / bw_hbm)
-                + act_bytes / bw_hbm
-                + t_comm
-                + pipeline_fill_drain_s
-            )
-            * 1e6
+            else 0.0
         )
+        pure_us = roof_us + repass_spill_us
         if scope == "per_op":
             sub_pure_us = pure_us
         step_us = pure_us + n_ops * workload.op_overhead_us
+
+        coll_extra_s = (
+            num_ar * n_splits * xla_ar_factor * ar_hops
+            + (2 * l_moe * n_splits * xla_ar_factor if l_moe > 0 and ep_dp > 1 else 0)
+        ) * max(0.0, ctx.lat_coll_upper - lat_coll)
+        roof_upper_us = (
+            max(t_matmul_upper, (hbm_int + act_bytes) / bw_hbm)
+            + t_comm
+            + coll_extra_s
+            + pipeline_fill_drain_s
+        ) * 1e6
+        step_upper_us = max(
+            step_us,
+            roof_upper_us + repass_spill_us + n_ops * ctx.launch_gap_upper_us,
+        )
+
         d_bytes = bw_hbm * max(0, d_ops) * workload.op_overhead_us * 1e-6
         break_even = (
             round(max(0.0, (pure_us - sub_pure_us) / d_ops), 3) if d_ops > 0 else 0.0
@@ -823,6 +910,7 @@ def _evaluate_scopes(
                 roof_floor_us=round(roof_us, 2),
                 step_bound_us=round(step_us, 2),
                 break_even_op_overhead_us=break_even,
+                step_upper_us=round(step_upper_us, 2),
             )
         )
 
@@ -861,18 +949,23 @@ class _ScopeContext:
     exp_bytes: float
     experts_local: int
     ep_dp: int
+    eff_tp: int
     row_floor: int
     num_ar: int
     ar_hops: int
     ar_vol: float
     egress_bw: float
     lat_coll: float
+    lat_coll_upper: float
+    launch_gap_upper_us: float
     pp_stage_time: float
     a2a_time: float
     flops_dense: float
+    flops_kv: float
     flops_moe: float
     peak_w: float
     peak_e: float
+    bf16_peak: float
     kv_cache_read_bytes: float
     recurrent_state_rw_bytes: float
     bw_hbm: float
@@ -885,13 +978,14 @@ def _vmem_budget_bytes(workload: WorkloadSpec, chip_spec: ChipSpec) -> int:
     """Return usable VMEM bytes: user budget, Tiles budget, or chip default."""
     vmem_usable = chip_spec.vmem_usable_bytes
     tiles = workload.tiles
+    rp = workload.ring_plan or default_double_buffer_ring_plan(workload.dma_buffers)
     base_vmem_bytes = (
         int(workload.vmem_budget_mib * (1 << 20))
         if workload.vmem_budget_mib is not None
         else (tiles.vmem_mib << 20 if tiles else vmem_usable)
     )
     vmem_raw = (
-        base_vmem_bytes - (FIT_VMEM_HEADROOM_MIB << 20) * workload.vmem_fit_headroom
+        base_vmem_bytes - rp.compiler_spill_reserve_bytes * workload.vmem_fit_headroom
     )
     return min(vmem_usable, max(0, vmem_raw))
 
@@ -899,23 +993,23 @@ def _vmem_budget_bytes(workload: WorkloadSpec, chip_spec: ChipSpec) -> int:
 def _whole_step_staging(
     workload: WorkloadSpec, layer_dense_weight_bytes: int
 ) -> tuple[float, int, int]:
-    """Return first DMA slot bytes and multi-layer dense and expert staging bytes.
-
-    ExecSpec.Tiles slot counts (nbd, nbe) and slot widths (bank, ebank) map to
-    dense_buffer_slots, expert_buffer_slots, dense_slot_bytes, expert_slot_bytes.
-    Not modeled yet: per-stream slot counts, e.g. 3 slots for recurrent-state
-    read-update-write streams while large weight banks stay on 2 slots.
-    """
+    """Return first DMA slot bytes and multi-layer dense and expert staging bytes."""
     tiles = workload.tiles
     if tiles is not None:
         dense_slot_bytes = tiles.bank
         dense_staging = tiles.nbd * tiles.bank
         expert_staging = tiles.nbe * tiles.ebank
     else:
-        dense_slot_bytes = 2 << 20
-        extra_slot_bytes = (workload.dma_buffers - 2) * (2 << 20)
-        dense_staging = min(28 << 20, 2 * layer_dense_weight_bytes) + extra_slot_bytes
-        expert_staging = (10 << 20) + extra_slot_bytes
+        rp = workload.ring_plan or default_double_buffer_ring_plan(workload.dma_buffers)
+        dense_slot_bytes = rp.dense_slot_bytes
+        extra_dense_bytes = (
+            rp.dense_slots - _DOUBLE_BUFFER_SLOTS
+        ) * rp.dense_slot_bytes
+        extra_expert_bytes = (
+            rp.expert_slots - _DOUBLE_BUFFER_SLOTS
+        ) * rp.expert_slot_bytes
+        dense_staging = min(28 << 20, 2 * layer_dense_weight_bytes) + extra_dense_bytes
+        expert_staging = (10 << 20) + extra_expert_bytes
     first_slot_bytes = float(
         min(dense_slot_bytes, max(1 << 18, layer_dense_weight_bytes // 4))
     )
@@ -931,14 +1025,25 @@ def _build_scope_context(
 ) -> _ScopeContext:
     """Assemble per-core weight, state, FLOP, and VMEM scope context."""
     bw_w, bw_e, bw_kv, bw_st = dtypes_bw
-    num_layers, hidden = profile.num_layers, profile.hidden_size
-    num_experts, top_k = profile.num_experts, profile.top_k
+    num_layers, hidden, num_experts, top_k = (
+        profile.num_layers,
+        profile.hidden_size,
+        profile.num_experts,
+        profile.top_k,
+    )
     tp, pp, dp, ep = workload.tp, workload.pp, workload.dp, workload.ep
-    kv_split = max(workload.kv_split, workload.dcp)
+    eff_tp, kv_split, spec_tok = (
+        max(tp, workload.dcp) if tp == 1 else tp,
+        max(workload.kv_split, workload.dcp),
+        workload.spec_tokens,
+    )
     eff_pcp = workload.pcp if workload.phase in ("prefill", "mixed") else 1
-    spec_tok = workload.spec_tokens
-    head_dim, kv_lora = profile.head_dim, profile.kv_lora_rank
-    q_lora, qk_rope = profile.q_lora_rank, profile.qk_rope_head_dim
+    head_dim, kv_lora, q_lora, qk_rope = (
+        profile.head_dim,
+        profile.kv_lora_rank,
+        profile.q_lora_rank,
+        profile.qk_rope_head_dim,
+    )
 
     uncached_isl = max(1, round(workload.isl * (1.0 - workload.prefix_hit_rate)))
     batch_local, chunk_tokens, layers_local = (
@@ -980,8 +1085,8 @@ def _build_scope_context(
     qk_nope = profile.qk_nope_head_dim or head_dim
     kd, vd = profile.linear_key_dim, profile.linear_value_dim
     nh_local, kvh_local = (
-        max(1, ceil(profile.num_attention_heads / tp)),
-        max(1, ceil(profile.num_kv_heads / (tp // kv_split))),
+        max(1, ceil(profile.num_attention_heads / eff_tp)),
+        max(1, ceil(profile.num_kv_heads / max(1, eff_tp // kv_split))),
     )
     q_dim, q_tot = nh_local * head_dim, nh_local * (qk_nope + qk_rope)
     mla_proj_params = (
@@ -992,23 +1097,23 @@ def _build_scope_context(
         if kv_lora
         else hidden * 2 * (q_dim + kvh_local * head_dim)
     )
-    kh_local = max(1, ceil(profile.linear_key_heads / tp)) if l_lin > 0 else 0
-    vh_local = max(1, ceil(profile.linear_value_heads / tp)) if l_lin > 0 else 0
+    kh_local = max(1, ceil(profile.linear_key_heads / eff_tp)) if l_lin > 0 else 0
+    vh_local = max(1, ceil(profile.linear_value_heads / eff_tp)) if l_lin > 0 else 0
     z_dim, qkv_lin, ep_tp = (
         vh_local * vd,
         2 * kh_local * kd + vh_local * vd,
-        gcd(ep, tp),
+        gcd(ep, eff_tp),
     )
     linear_attn_params, experts_local = (
         hidden * (qkv_lin + 2 * z_dim) * (l_lin > 0),
         (num_experts // ep) * (l_moe > 0),
     )
     dense_ffn_params, shared_expert_params, ep_dp = (
-        3 * hidden * max(1, ceil(profile.intermediate_size / tp)),
-        3 * hidden * ceil(profile.shared_expert_intermediate_size / tp),
+        3 * hidden * max(1, ceil(profile.intermediate_size / eff_tp)),
+        3 * hidden * ceil(profile.shared_expert_intermediate_size / eff_tp),
         ep // ep_tp,
     )
-    i_exp_local = ceil(profile.moe_intermediate_size / (tp // ep_tp)) * (l_moe > 0)
+    i_exp_local = ceil(profile.moe_intermediate_size / (eff_tp // ep_tp)) * (l_moe > 0)
     routed_expert_params = (
         3 * (profile.routed_expert_hidden_size or hidden) * i_exp_local
     )
@@ -1050,10 +1155,18 @@ def _build_scope_context(
     d_mla = (active_tokens - t_prefill_part) * (
         2 * kv_lora + qk_rope
     ) + t_prefill_part * (qk_nope + qk_rope + head_dim)
+    # Causal prefill attention: each of T new tokens attends to prefix + (1..T),
+    # giving mean context prefix + (T + 1) / 2 instead of rectangular eff_ctx.
+    prefix_ctx = max(0, eff_ctx - t_prefill_part)
+    attn_ctx = (
+        prefix_ctx + (t_prefill_part + 1) / 2.0
+        if workload.phase == "prefill" and t_prefill_part > 1
+        else float(eff_ctx)
+    )
     flops_kv = (
         2.0
         * l_attn
-        * eff_ctx
+        * attn_ctx
         * (nh_local * d_mla if kv_lora else 2.0 * active_tokens * q_dim)
     )
     flops_dense = (
@@ -1084,6 +1197,9 @@ def _build_scope_context(
         whole_step_dense_staging_bytes,
         whole_step_expert_staging_bytes,
     ) = _whole_step_staging(workload, layer_dense_weight_bytes)
+    has_unmodeled_family = any(
+        fam not in SUPPORTED_ONCHIP_FAMILIES for fam in profile.layer_families
+    )
     return _ScopeContext(
         vmem_budget=vmem_budget,
         single_layer_dense_staging_bytes=min(4 << 20, layer_dense_weight_bytes),
@@ -1121,14 +1237,17 @@ def _build_scope_context(
         exp_bytes=exp_bytes,
         experts_local=experts_local,
         ep_dp=ep_dp,
+        eff_tp=eff_tp,
         row_floor=chip_spec.lhs_row_floor(
             profile.expert_dtype if l_moe > 0 else profile.weight_dtype
         ),
         num_ar=profile.ar_slots_per_layer * layers_local,
-        ar_hops=round(log2(tp)),
-        ar_vol=2.0 * (tp - 1) / tp * token_residual_bytes,
+        ar_hops=round(log2(eff_tp)),
+        ar_vol=2.0 * (eff_tp - 1) / eff_tp * token_residual_bytes,
         egress_bw=chip_spec.ici_egress_bw_bytes_per_s,
         lat_coll=chip_spec.collective_latency_s,
+        lat_coll_upper=chip_spec.collective_latency_us_bracket[1] * 1e-6,
+        launch_gap_upper_us=max(workload.op_overhead_us, _DEFAULT_LAUNCH_GAP_UPPER_US),
         pp_stage_time=(
             (
                 token_residual_bytes / chip_spec.ici_link_bw_bytes_per_s
@@ -1148,9 +1267,11 @@ def _build_scope_context(
             else 0.0
         ),
         flops_dense=flops_dense,
+        flops_kv=flops_kv,
         flops_moe=flops_moe,
         peak_w=chip_spec.peak_flops(profile.weight_dtype),
         peak_e=chip_spec.peak_flops(profile.expert_dtype),
+        bf16_peak=chip_spec.bf16_flops_per_s,
         kv_cache_read_bytes=kv_cache_read_bytes,
         recurrent_state_rw_bytes=recurrent_state_rw_bytes,
         bw_hbm=chip_spec.hbm_bw_bytes_per_s,
@@ -1165,23 +1286,383 @@ def _build_scope_context(
             or num_segments > 1
             or num_layers == 1
             or bool(plan_error)
-            or not profile.is_periodic
+            or has_unmodeled_family
         ),
         plan_error=plan_error,
     )
 
 
-def advise(
+_SETTLE_CMD = "Run advisor calibrate --trace <trace> --out measurements.json"
+
+
+def _resolve_calibrated_priors(
+    workload: WorkloadSpec,
+    chip_spec: ChipSpec,
+    ctx: _ScopeContext,
+    meas: MeasurementsData | None,
+) -> tuple[
+    tuple[float, float, float, ProvenanceTag, str],
+    tuple[float, float, float, ProvenanceTag, str],
+    tuple[float, list[float], ProvenanceTag, str],
+]:
+    """Return calibrated or assumed priors for launch gap, collectives, and coverage."""
+    if meas is not None and meas.launch_gap_p50_us is not None:
+        lg_lo = meas.launch_gap_p50_us
+        lg_hi = max(lg_lo, meas.launch_gap_p90_us or lg_lo)
+        lg_info: tuple[float, float, float, ProvenanceTag, str] = (
+            lg_lo,
+            lg_lo,
+            lg_hi,
+            "MEASURED",
+            f"{meas.source_desc} (n={meas.launch_gap_n})",
+        )
+    elif workload.op_overhead_us > 0.0:
+        lg_val = workload.op_overhead_us
+        lg_info = (
+            lg_val,
+            lg_val,
+            max(lg_val, _DEFAULT_LAUNCH_GAP_UPPER_US),
+            "ASSUMED",
+            "caller WorkloadSpec.op_overhead_us override",
+        )
+    else:
+        lg_info = (
+            _DEFAULT_LAUNCH_GAP_VAL_US,
+            _DEFAULT_LAUNCH_GAP_FLOOR_US,
+            _DEFAULT_LAUNCH_GAP_UPPER_US,
+            "ASSUMED",
+            "uncalibrated TPU host/device launch gap prior [1.0, 8.0] us",
+        )
+
+    if meas is not None and meas.collective_hop_us is not None:
+        c_val = round(meas.collective_hop_us, 3)
+        coll_info: tuple[float, float, float, ProvenanceTag, str] = (
+            c_val,
+            c_val,
+            c_val,
+            "MEASURED",
+            f"{meas.source_desc} (n={meas.collective_n})",
+        )
+    else:
+        c_lo, c_hi = chip_spec.collective_latency_us_bracket
+        c_src = (chip_spec.sources or {}).get(
+            "collective_latency_us_bracket", "uncalibrated ICI hop latency bracket"
+        )
+        coll_info = (
+            round(chip_spec.collective_latency_s * 1e6, 3),
+            c_lo,
+            c_hi,
+            "ASSUMED",
+            c_src,
+        )
+
+    if meas is not None and meas.step_coverage is not None:
+        cov_val = round(meas.step_coverage, 4)
+        cov_info: tuple[float, list[float], ProvenanceTag, str] = (
+            cov_val,
+            [cov_val, cov_val],
+            "MEASURED",
+            f"{meas.source_desc} step_coverage",
+        )
+    elif workload.phase == "mixed":
+        dec_tok = ctx.batch_local * max(1, ctx.verify_tokens)
+        cov_val = round(min(1.0, dec_tok / max(1, ctx.active_tokens)), 4)
+        cov_info = (
+            cov_val,
+            [0.0, 1.0],
+            "ASSUMED",
+            "decode token share on mixed step (settle via --measurements)",
+        )
+    else:
+        cov_info = (
+            1.0,
+            [0.0, 1.0],
+            "ASSUMED",
+            "single-phase step coverage prior (settle via --measurements)",
+        )
+    return lg_info, coll_info, cov_info
+
+
+def _collect_unresolved_assumptions(
+    workload: WorkloadSpec,
+    chip_spec: ChipSpec,
+    ctx: _ScopeContext,
+    bounds: tuple[
+        int,
+        float,
+        tuple[float, float, ProvenanceTag],
+        tuple[float, float, ProvenanceTag],
+        ProvenanceTag,
+    ],
+) -> list[dict[str, object]]:
+    """Collect and sort unresolved ASSUMED inputs by step-time sensitivity."""
+    d_ops, b_val, (lg_lo, lg_hi, lg_tag), (coll_lo, coll_hi, coll_tag), cov_tag = bounds
+    unresolved: list[dict[str, object]] = []
+    if lg_tag == "ASSUMED":
+        unresolved.append(
+            {
+                "name": "launch_gap_us",
+                "band": [lg_lo, lg_hi],
+                "unit": "us",
+                "sensitivity_us": round(d_ops * (lg_hi - lg_lo), 2),
+                "how_to_settle": _SETTLE_CMD,
+            }
+        )
+    if coll_tag == "ASSUMED" and ctx.eff_tp * workload.ep > 1:
+        unresolved.append(
+            {
+                "name": "collective_latency_us",
+                "band": [coll_lo, coll_hi],
+                "unit": "us/hop",
+                "sensitivity_us": round(
+                    ctx.num_ar * ctx.ar_hops * max(0.0, coll_hi - coll_lo), 2
+                ),
+                "how_to_settle": _SETTLE_CMD,
+            }
+        )
+    if (
+        workload.phase in ("prefill", "mixed")
+        and chip_spec.native_ocp_fp8
+        and ctx.flops_kv > 0
+    ):
+        attn_sens_us = (ctx.flops_kv / ctx.bf16_peak - ctx.flops_kv / ctx.peak_w) * 1e6
+        unresolved.append(
+            {
+                "name": "prefill_attn_dot_dtype",
+                "band": [
+                    round(ctx.bf16_peak / 1e12, 1),
+                    round(ctx.peak_w / 1e12, 1),
+                ],
+                "unit": "TFLOP/s",
+                "sensitivity_us": round(max(0.0, attn_sens_us), 2),
+                "how_to_settle": "Inspect XProf HLO attention dot precision",
+            }
+        )
+    if cov_tag == "ASSUMED":
+        unresolved.append(
+            {
+                "name": "step_coverage",
+                "band": [0.0, 1.0],
+                "unit": "ratio",
+                "sensitivity_us": round(b_val, 2),
+                "how_to_settle": _SETTLE_CMD,
+            }
+        )
+    unresolved.sort(key=lambda item: float(str(item["sensitivity_us"])), reverse=True)
+    return unresolved
+
+
+def _build_provenance_and_verdict(
     profile: ModelProfile,
+    workload: WorkloadSpec,
+    chip_spec: ChipSpec,
+    ctx: _ScopeContext,
+    info: tuple[list[ScopeEstimate], ScopeEstimate, int, bool, MeasurementsData | None],
+) -> tuple[
+    dict[str, ProvenanceMetric],
+    tuple[str, ...],
+    str,
+    str,
+    tuple[dict[str, object], ...],
+]:
+    """Assemble provenance-tagged metrics, flags, confidence, and verdict."""
+    estimates, best, ridge_tokens, hbm_fits, meas = info
+    per_op_sc = estimates[0]
+    d_ops = max(0, per_op_sc.ops_per_step - best.ops_per_step)
+    (
+        (lg_val, lg_lo, lg_hi, lg_tag, lg_src),
+        (coll_val, coll_lo, coll_hi, coll_tag, coll_src),
+        (cov_val, cov_band, cov_tag, cov_src),
+    ) = _resolve_calibrated_priors(workload, chip_spec, ctx, meas)
+
+    pure_diff_us = max(0.0, per_op_sc.step_bound_us - best.step_bound_us)
+    b_val = round(d_ops * lg_val + pure_diff_us, 2)
+    b_lo = round(d_ops * lg_lo + pure_diff_us, 2)
+    b_hi = round(
+        d_ops * lg_hi
+        + pure_diff_us
+        + ctx.num_ar * ctx.ar_hops * max(0.0, coll_hi - coll_lo),
+        2,
+    )
+    b_tag: ProvenanceTag = (
+        "MEASURED" if lg_tag == "MEASURED" and coll_tag == "MEASURED" else "ASSUMED"
+    )
+
+    denom_us = max(1e-6, per_op_sc.step_bound_us + per_op_sc.ops_per_step * lg_val)
+    fg_val = round(min(1.0, max(0.0, b_val / denom_us)), 4)
+    fg_lo = round(min(fg_val, max(0.0, b_lo / denom_us)), 4)
+    fg_hi = round(max(fg_val, min(1.0, b_hi / denom_us)), 4)
+    eg_val, eg_lo, eg_hi = (
+        round(fg_val * cov_val, 4),
+        round(fg_lo * cov_band[0], 4),
+        round(fg_hi * cov_band[1], 4),
+    )
+
+    tokens_per_chip = ctx.active_tokens / max(1, ctx.eff_tp * workload.pp)
+    tput_hi = round(tokens_per_chip / max(1e-9, best.step_bound_us * 1e-6), 2)
+    tput_lo = round(
+        tokens_per_chip / max(1e-9, max(best.step_bound_us, best.step_upper_us) * 1e-6),
+        2,
+    )
+
+    metrics: dict[str, ProvenanceMetric] = {
+        "fits_hbm": {
+            "value": hbm_fits,
+            "unit": "bool",
+            "tag": "DERIVED",
+            "source": "hbm_used <= chip_spec.hbm_capacity_bytes",
+            "band": [float(hbm_fits), float(hbm_fits)],
+        },
+        "tokens_per_core": {
+            "value": ctx.active_tokens,
+            "unit": "tok",
+            "tag": "DERIVED",
+            "source": "WorkloadSpec batch * phase tokens / (dp * pcp)",
+            "band": [float(ctx.active_tokens), float(ctx.active_tokens)],
+        },
+        "onchip_ceiling": {
+            "value": best.t_vmem_max,
+            "unit": "tok",
+            "tag": "DERIVED",
+            "source": "(vmem_budget - static_vmem_bytes) // per_token_vmem_bytes",
+            "band": [float(best.t_vmem_max), float(best.t_vmem_max)],
+        },
+        "compute_bound_at": {
+            "value": ridge_tokens,
+            "unit": "tok",
+            "tag": "DERIVED",
+            "source": "(w_step + state_bytes) * ridge_flop_per_byte / flop_per_tok",
+            "band": [float(ridge_tokens), float(ridge_tokens)],
+        },
+        "launch_gap_us": {
+            "value": lg_val,
+            "unit": "us",
+            "tag": lg_tag,
+            "source": lg_src,
+            "band": [lg_lo, lg_hi],
+        },
+        "collective_latency_us": {
+            "value": coll_val,
+            "unit": "us/hop",
+            "tag": coll_tag,
+            "source": coll_src,
+            "band": [coll_lo, coll_hi],
+        },
+        "step_floor_us": {
+            "value": best.step_bound_us,
+            "unit": "us",
+            "tag": "DERIVED",
+            "source": f"roofline floor for scope={best.scope}",
+            "band": [best.step_bound_us, max(best.step_bound_us, best.step_upper_us)],
+        },
+        "throughput_tok_s_per_chip": {
+            "value": tput_hi,
+            "unit": "tok/s/chip",
+            "tag": "DERIVED",
+            "source": "tokens_per_chip / (step_floor_us * 1e-6)",
+            "band": [min(tput_lo, tput_hi), max(tput_lo, tput_hi)],
+        },
+        "boundary_cost_us": {
+            "value": b_val,
+            "unit": "us",
+            "tag": b_tag,
+            "source": "(per_op_ops - scope_ops) * launch_gap_us + collective_saving_us",
+            "band": [min(b_lo, b_hi), max(b_lo, b_hi)],
+        },
+        "fusion_gain_max": {
+            "value": fg_val,
+            "unit": "ratio",
+            "tag": "DERIVED",
+            "source": "boundary_cost_us / per_op_step_us",
+            "band": [fg_lo, fg_hi],
+        },
+        "step_coverage": {
+            "value": cov_val,
+            "unit": "ratio",
+            "tag": cov_tag,
+            "source": cov_src,
+            "band": cov_band,
+        },
+        "expected_gain_max": {
+            "value": eg_val,
+            "unit": "ratio",
+            "tag": "DERIVED",
+            "source": "fusion_gain_max * step_coverage",
+            "band": [eg_lo, eg_hi],
+        },
+    }
+
+    flags_list = [
+        flag
+        for cond, flag in (
+            (profile.architecture_unverified, "architecture_unverified"),
+            (best.n_splits > 1, "multi_call_unmodeled"),
+            (cov_tag == "ASSUMED", "coverage_assumed"),
+        )
+        if cond
+    ]
+    unresolved = _collect_unresolved_assumptions(
+        workload,
+        chip_spec,
+        ctx,
+        (
+            d_ops,
+            b_val,
+            (lg_lo, lg_hi, lg_tag),
+            (coll_lo, coll_hi, coll_tag),
+            cov_tag,
+        ),
+    )
+    feasible_others = [e for e in estimates if e.feasible and e.scope != best.scope]
+    runner_up = (
+        min(feasible_others, key=lambda e: (e.step_bound_us, e.ops_per_step))
+        if feasible_others
+        else None
+    )
+    is_tie = (
+        hbm_fits
+        and runner_up is not None
+        and best.step_upper_us >= runner_up.step_bound_us
+        and bool(unresolved)
+    )
+    verdict = (
+        f"tie(measure: {unresolved[0]['name']})"
+        if is_tie
+        else (
+            "megakernel_likely"
+            if hbm_fits and best.scope != "per_op"
+            else "separate_likely"
+        )
+    )
+    confidence = (
+        "validated_end_to_end"
+        if meas is not None and meas.step_time_us is not None
+        else ("bounded" if meas is not None else "prior_only")
+    )
+    return metrics, tuple(flags_list), verdict, confidence, tuple(unresolved)
+
+
+def advise(
+    profile: ModelProfile | str | Mapping[str, object],
     workload: WorkloadSpec,
     chip: ChipSpec | str = "tpu7x",
     plan_error: str = "",
+    **extra: object,
 ) -> AdvisorReport:
     """Evaluate fusion scopes from first-principles hardware and model bounds."""
-    dtypes_bw = _validate_advise_inputs(profile, workload)
-    chip_spec = resolve_chip_spec(chip)
-    ctx = _build_scope_context(profile, workload, chip_spec, dtypes_bw, plan_error)
-    estimates, raw_step_map = _evaluate_scopes(ctx, profile, workload)
+    prof = resolve_model_profile(profile)
+    meas_arg = extra.get("measurements")
+    meas = load_measurements(meas_arg) if meas_arg is not None else None
+    chip_spec_path = extra.get("chip_spec_path")
+    cs_path = str(chip_spec_path) if chip_spec_path is not None else None
+    eff_wl = workload
+    if meas is not None and meas.ring_plan is not None and eff_wl.ring_plan is None:
+        eff_wl = replace(eff_wl, ring_plan=meas.ring_plan)
+
+    dtypes_bw = _validate_advise_inputs(prof, eff_wl)
+    chip_spec = resolve_chip_spec(chip, chip_spec_path=cs_path)
+    ctx = _build_scope_context(prof, eff_wl, chip_spec, dtypes_bw, plan_error)
+    estimates, raw_step_map = _evaluate_scopes(ctx, prof, eff_wl)
 
     hbm_used = ctx.hbm_used
     hbm_fits = hbm_used <= chip_spec.hbm_capacity_bytes
@@ -1191,7 +1672,7 @@ def advise(
     ridge = ctx.peak_w / ctx.bw_hbm
     b_wa = best.w_step_gb * 1e9 * best.n_splits + best.act_hbm_mb * 1e6
     state_bytes = ctx.kv_cache_read_bytes + ctx.recurrent_state_rw_bytes
-    kv_lora, qk_rope = profile.kv_lora_rank, profile.qk_rope_head_dim
+    kv_lora, qk_rope = prof.kv_lora_rank, prof.qk_rope_head_dim
     nh_local, q_dim = ctx.nh_local, ctx.q_dim
     v_q = nh_local * (2 * kv_lora + qk_rope) if kv_lora else 2.0 * q_dim
     tot_bytes = max(1.0, b_wa + state_bytes)
@@ -1201,7 +1682,7 @@ def advise(
     flops_dense, flops_moe = ctx.flops_dense, ctx.flops_moe
     v_p = (
         ctx.base_dense_params
-        + l_moe * profile.hidden_size * profile.num_experts
+        + l_moe * prof.hidden_size * prof.num_experts
         + flops_moe / (2.0 * active_tokens)
     )
     v_flops = 2.0 * ctx.batch_local * ctx.verify_tokens * (v_p + l_attn * eff_ctx * v_q)
@@ -1228,14 +1709,22 @@ def advise(
         t_per_ep = ceil(active_tokens / max(1, best.n_splits)) * ctx.ep_dp
         rec_moe = (
             "grouped_on_chip"
-            if t_per_ep >= _GROUPED_MOE_MIN_TOKENS
+            if t_per_ep >= chip_spec.lhs_row_floor(prof.expert_dtype)
             else "masked_on_chip"
         )
 
+    metrics, flags, verdict, confidence, unresolved = _build_provenance_and_verdict(
+        prof,
+        eff_wl,
+        chip_spec,
+        ctx,
+        (estimates, best, ridge_tokens, hbm_fits, meas),
+    )
+
     return AdvisorReport(
-        model=profile.name,
+        model=prof.name,
         chip=chip_spec.name,
-        phase=workload.phase,
+        phase=eff_wl.phase,
         active_tokens=active_tokens,
         effective_context=eff_ctx,
         vmem_budget_mib=round(ctx.vmem_budget / (1 << 20), 3),
@@ -1252,8 +1741,81 @@ def advise(
         per_token_vmem_bytes=ctx.per_token_fused_bytes,
         ridge_tokens=ridge_tokens,
         recommended_moe_mode=rec_moe,
-        dma_buffers=workload.dma_buffers,
+        dma_buffers=eff_wl.dma_buffers,
+        verdict=verdict,
+        confidence=confidence,
+        flags=flags,
+        metrics=metrics,
+        unresolved_assumptions=unresolved,
     )
+
+
+def compare_parallelism_candidates(
+    profile: ModelProfile | str | Mapping[str, object],
+    layouts: Sequence[ParallelLayout],
+    *,
+    batch: int = 16,
+    chip: ChipSpec | str = "tpu7x",
+    **opts: object,
+) -> dict[str, object]:
+    """Compare ParallelLayouts under step-latency and chip-throughput objectives."""
+    prof = resolve_model_profile(profile)
+    chip_spec = resolve_chip_spec(chip)
+    context = _int_opt(opts, "context", 4096)
+    objective = str(opts.get("objective", "both"))
+    rows: list[dict[str, object]] = []
+    for layout in layouts:
+        wl = WorkloadSpec(
+            phase="decode",
+            batch=batch * layout.dp,
+            isl=context,
+            osl=0,
+            context=context,
+            tp=layout.tp,
+            ep=layout.ep,
+            dp=layout.dp,
+            pp=layout.pp,
+            dcp=layout.dcp,
+            pcp=layout.pcp,
+            layer_groups=layout.layer_groups,
+            moe_mode="grouped_on_chip" if prof.num_experts > 0 else "dense_mlp",
+        )
+        rep = advise(prof, wl, chip_spec)
+        step_us = float(rep.metrics["step_floor_us"]["value"])
+        tput = float(rep.metrics["throughput_tok_s_per_chip"]["value"])
+        rows.append(
+            {
+                "layout": layout.label(),
+                "step_floor_us": step_us,
+                "throughput_tok_s_per_chip": tput,
+                "recommended_scope": rep.recommended_scope,
+                "hbm_fits": rep.hbm_fits,
+            }
+        )
+    feasible_rows = [r for r in rows if bool(r["hbm_fits"])] or rows
+    best_step = min(feasible_rows, key=lambda r: float(str(r["step_floor_us"])))
+    best_tput = max(
+        feasible_rows, key=lambda r: float(str(r["throughput_tok_s_per_chip"]))
+    )
+    step_lbl = str(best_step["layout"])
+    tput_lbl = str(best_tput["layout"])
+    if objective == "step":
+        verdict = step_lbl
+    elif objective == "throughput":
+        verdict = tput_lbl
+    elif step_lbl != tput_lbl:
+        verdict = f"tie(objective_split: step={step_lbl}, throughput={tput_lbl})"
+    else:
+        verdict = step_lbl
+    return {
+        "model": prof.name,
+        "chip": chip_spec.name,
+        "objective": objective,
+        "best_step_layout": step_lbl,
+        "best_throughput_layout": tput_lbl,
+        "verdict": verdict,
+        "candidates": rows,
+    }
 
 
 def recommend_parallelism(
@@ -1286,7 +1848,7 @@ def recommend_parallelism(
             continue
         sub = rep.scopes[0]
         total_cores = tp_cand * dp * pp
-        topo = _TPU7X_TOPOLOGIES.get(total_cores, f"{total_cores} cores")
+        topo = TPU7X_TOPOLOGIES.get(total_cores, f"{total_cores} cores")
         cand = ParallelismRecommendation(
             tp=tp_cand,
             ep=ep_cand,
@@ -1299,10 +1861,15 @@ def recommend_parallelism(
             auto_selected=True,
         )
         fallback = cand
-        if (
-            rep.hbm_used_gb <= 0.80 * rep.hbm_capacity_gb
-            and sub.w_step_gb <= _MAX_RECOMMENDED_STEP_WEIGHT_GB
-        ):
+        # Verify HBM capacity holds at the high-concurrency 32K regime (B=64, 32K)
+        # and that a 16-token speculative verify batch fits in one VMEM pass.
+        rep_high = advise(
+            profile,
+            replace(wl, batch=64, isl=32768, context=32768),
+            chip_spec,
+        )
+        whole_sc = next(s for s in rep.scopes if s.scope == "whole_step")
+        if rep_high.hbm_fits and whole_sc.n_splits == 1:
             return cand
     if fallback is not None:
         return fallback
@@ -1311,7 +1878,7 @@ def recommend_parallelism(
         ep=gcd(8 * dp, profile.num_experts) if profile.num_experts > 0 else 1,
         dp=dp,
         pp=pp,
-        topology=_TPU7X_TOPOLOGIES.get(8 * dp * pp, f"{8 * dp * pp} cores"),
+        topology=TPU7X_TOPOLOGIES.get(8 * dp * pp, f"{8 * dp * pp} cores"),
         hbm_used_gb=0.0,
         hbm_capacity_gb=round(chip_spec.hbm_capacity_bytes / 1e9, 3),
         w_step_gb=0.0,
@@ -1322,13 +1889,13 @@ def recommend_parallelism(
 def _int_opt(opts: Mapping[str, object], key: str, default: int) -> int:
     """Extract an integer option from opts or return default."""
     val = opts.get(key, default)
-    return int(val) if isinstance(val, (int, float, str)) else default
+    return int(float(str(val))) if type(val) in (int, float, str) else default
 
 
 def _float_opt(opts: Mapping[str, object], key: str, default: float) -> float:
     """Extract a float option from opts or return default."""
     val = opts.get(key, default)
-    return float(val) if isinstance(val, (int, float, str)) else default
+    return float(str(val)) if type(val) in (int, float, str) else default
 
 
 def _layout_recommendation(
@@ -1361,7 +1928,7 @@ def _layout_recommendation(
         ep=layout.ep,
         dp=layout.dp,
         pp=layout.pp,
-        topology=_TPU7X_TOPOLOGIES.get(total_cores, f"{total_cores} cores"),
+        topology=TPU7X_TOPOLOGIES.get(total_cores, f"{total_cores} cores"),
         hbm_used_gb=base_rep.hbm_used_gb,
         hbm_capacity_gb=base_rep.hbm_capacity_gb,
         w_step_gb=base_rep.scopes[0].w_step_gb,
@@ -1450,15 +2017,17 @@ def advise_regimes(
     raw_tp = opts.get("tp")
     raw_ep = opts.get("ep")
     raw_vmem = opts.get("vmem_budget_mib")
-    tp = int(raw_tp) if isinstance(raw_tp, int) else None
-    ep = int(raw_ep) if isinstance(raw_ep, int) else None
+    tp = int(raw_tp) if type(raw_tp) is int else None
+    ep = int(raw_ep) if type(raw_ep) is int else None
     vmem_budget_mib = (
-        float(raw_vmem) if isinstance(raw_vmem, (int, float, str)) else None
+        float(str(raw_vmem)) if type(raw_vmem) in (int, float, str) else None
     )
     dp = _int_opt(opts, "dp", 1)
     pp = _int_opt(opts, "pp", 1)
     dcp = _int_opt(opts, "dcp", 1)
     pcp = _int_opt(opts, "pcp", 1)
+    meas_opt = opts.get("measurements")
+    cs_path_opt = opts.get("chip_spec_path")
     base = WorkloadSpec(
         vmem_alias=bool(opts.get("vmem_alias", True)),
         vmem_fit_headroom=bool(opts.get("vmem_fit_headroom", False)),
@@ -1469,7 +2038,10 @@ def advise_regimes(
     dma_buffers = base.dma_buffers
 
     prof = resolve_model_profile(profile)
-    chip_spec = resolve_chip_spec(chip)
+    chip_spec = resolve_chip_spec(
+        chip,
+        chip_spec_path=str(cs_path_opt) if cs_path_opt is not None else None,
+    )
     explicit_layout = tp is not None or ep is not None or (dp, pp, dcp, pcp) != (1,) * 4
     dep = (
         DEPLOYMENT_PRESETS.get(prof.name)
@@ -1627,7 +2199,7 @@ def advise_regimes(
     entries: list[RegimeEntry] = []
     reports: list[AdvisorReport] = []
     for label, wl in workloads:
-        rep = advise(prof, wl, chip_spec)
+        rep = advise(prof, wl, chip_spec, measurements=meas_opt)
         reports.append(rep)
         best_sc = next(s for s in rep.scopes if s.scope == rep.recommended_scope)
         entries.append(
@@ -1646,6 +2218,12 @@ def advise_regimes(
                 layout=ParallelLayout(
                     tp=wl.tp, ep=wl.ep, dp=wl.dp, pp=wl.pp, dcp=wl.dcp, pcp=wl.pcp
                 ).label(),
+                step_upper_us=best_sc.step_upper_us,
+                verdict=rep.verdict,
+                confidence=rep.confidence,
+                flags=rep.flags,
+                metrics=rep.metrics,
+                unresolved_assumptions=rep.unresolved_assumptions,
             )
         )
 
@@ -1708,6 +2286,9 @@ def advise_from_spec(
     op_overhead_us: float = 0.0,
 ) -> AdvisorReport:
     """Bridge declarative ModelSpec + ExecSpec schedules via planner.plan."""
+    jnp = importlib.import_module("jax.numpy")
+    planner = importlib.import_module("vllm_torchtpu.megakernel.planner")
+
     plan_err = ""
     ar_slots = 2
     is_periodic = True
@@ -1796,22 +2377,33 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 __all__ = [
+    "BUILTIN_CHIP_SPECS",
     "DEPLOYMENT_PRESETS",
-    "FIT_VMEM_HEADROOM_MIB",
+    "DEPLOYMENT_PRESET_SOURCES",
     "MODEL_PRESETS",
+    "MODEL_PRESET_SOURCES",
     "REGISTERED_MODEL_ALIASES",
+    "REQUIRED_CHIP_SPEC_KEYS",
     "SUPPORTED_MODEL_TYPES",
+    "SUPPORTED_ONCHIP_FAMILIES",
+    "VERIFIED_MEGAKERNEL_MODEL_TYPES",
     "AdvisorReport",
     "AdvisorSweepReport",
     "ChipSpec",
     "DeploymentPreset",
+    "FieldSource",
     "FusionScope",
+    "MeasurementsData",
     "MoEMode",
     "ModelProfile",
+    "ObjectiveMode",
     "ParallelLayout",
     "ParallelismRecommendation",
     "Phase",
+    "ProvenanceMetric",
+    "ProvenanceTag",
     "RegimeEntry",
+    "RingPlan",
     "ScopeEstimate",
     "UnsupportedArchitectureError",
     "WorkloadSpec",
@@ -1819,10 +2411,14 @@ __all__ = [
     "advise_from_spec",
     "advise_regimes",
     "build_arg_parser",
+    "compare_parallelism_candidates",
     "compute_per_token_vmem_bytes",
+    "default_double_buffer_ring_plan",
     "fit_vmem_budget_bytes",
     "format_advisor_summary",
     "format_regime_table",
+    "load_chip_spec_file",
+    "load_measurements",
     "main",
     "model_profile_from_hf_config",
     "recommend_parallelism",
@@ -1830,5 +2426,6 @@ __all__ = [
     "resolve_chip_spec",
     "resolve_model_profile",
     "supports_hf_config",
+    "verify_chip_spec_against_jax",
     "write_advisor_html",
 ]

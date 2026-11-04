@@ -55,7 +55,9 @@ def _esc(val: object) -> str:
     return "" if val is None else html.escape(str(val))
 
 
-def format_advisor_summary(rep: AdvisorReport) -> str:
+def format_advisor_summary(
+    rep: AdvisorReport, *, explain: bool = False, unresolved: bool = False
+) -> str:
     """Format single-workload AdvisorReport for terminal output."""
     slope_kib = rep.per_token_vmem_bytes / 1024.0
     ridge_fb = rep.ridge_dense_flop_per_byte
@@ -67,7 +69,7 @@ def format_advisor_summary(rep: AdvisorReport) -> str:
         (
             f"Recommended: {rep.recommended_scope} "
             f"[moe={rep.recommended_moe_mode}] "
-            f"(build={rep.build_megakernel})"
+            f"(build={rep.build_megakernel}, verdict={rep.verdict})"
         ),
         f"Rationale: {rep.rationale}",
         (
@@ -83,6 +85,20 @@ def format_advisor_summary(rep: AdvisorReport) -> str:
         f"static_vmem={sc.vmem_static_mib:5.2f} MiB]"
         for sc in rep.scopes
     )
+    if explain and rep.metrics:
+        lines.append("Provenance Breakdown:")
+        lines.extend(
+            f"  * [{item['tag']}] {key}: {item['value']} {item['unit']} "
+            f"(band=[{item['band'][0]}, {item['band'][1]}], source={item['source']})"
+            for key, item in rep.metrics.items()
+        )
+    if unresolved and rep.unresolved_assumptions:
+        lines.append("Unresolved Assumptions:")
+        lines.extend(
+            f"  * {item['name']} (band={item['band']} {item['unit']}): "
+            f"{item['how_to_settle']}"
+            for item in rep.unresolved_assumptions
+        )
     return "\n".join(lines)
 
 
