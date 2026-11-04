@@ -1,0 +1,921 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Kimi K3 MonoProgram adapter and pre-quantization hooks."""
+
+from __future__ import annotations
+
+import dataclasses
+import importlib
+import threading
+from collections.abc import Iterable, Mapping, Sequence
+
+import numpy as np
+import torch
+
+from vllm_torchtpu.megakernel.runtime.contract import EligibilityResult
+from vllm_torchtpu.megakernel.runtime.eligibility import check_step_eligibility
+from vllm_torchtpu.megakernel.runtime.policy import (
+    BucketPolicy,
+    parse_mk_verify_buckets,
+)
+from vllm_torchtpu.megakernel.runtime.stats import BatchShape
+from vllm_torchtpu.megakernel_runtime.plugin import (
+    Bucket,
+    Decline,
+    ForwardView,
+    LayoutDecline,
+    RunnerShape,
+    RunnerView,
+    StepDecision,
+    StepFn,
+    WarmupCase,
+)
+from vllm_torchtpu.models.kimi_k3.megakernel.kernels.load import pack_expert_bytes
+from vllm_torchtpu.models.kimi_k3.megakernel.layout import FP8_LAYOUT, LAYOUT
+from vllm_torchtpu.models.kimi_k3.megakernel.pools import SlotMap
+
+KIMI_K3_LAYERS = 93
+KIMI_K3_MLA_POOLS = 24
+KIMI_K3_KDA_LAYERS = 69
+KIMI_K3_HIDDEN_SIZE = 7168
+KIMI_K3_POOL_ENTRY_WIDTH = 640
+KIMI_K3_NUM_EXPERTS = 896
+KIMI_K3_EP_GROUPS = 8
+KIMI_K3_ETP_PARTS = 4
+SUPPORTED_ARCHS = frozenset({"KimiK3ForConditionalGeneration"})
+TPU_REQUIRED_TP_SIZE = 32
+SUPPORTED_TPU_TP_SIZES = (TPU_REQUIRED_TP_SIZE,)
+SUPPORTED_CPU_TP_SIZES = (1, 2, TPU_REQUIRED_TP_SIZE)
+SUPPORTED_ATTENTION_DP_SIZES = (1, 2, 4)
+VALID_BLOCK_SIZES = (128, 256, 512, 1024, 2048)
+DEFAULT_BF16_BLOCK_SIZE = 256
+DEFAULT_FP8_BLOCK_SIZE = 512
+DEFAULT_DECODE_BUCKETS = (1, 2, 4, 8, 16)
+VERIFY_TOKEN_COUNT = 8
+DEFAULT_SPECULATIVE_TOKENS = 7
+DEFAULT_VERIFY_BUCKETS = (8, 16)
+PACKED_MATRIX_NDIM = 2
+STACKED_EXPERT_NDIM = 3
+U32_PACK_FACTOR = 4
+MIN_OUT_ROW_ALIGNMENT = 16
+DEFAULT_MAX_SLOTS = 64
+
+
+@dataclasses.dataclass
+class ObservedMxfp4Entry:
+    """Captured pre-quantization MXFP4 packed tensor or E8M0 scale tensor."""
+
+    name: str
+    kind: str
+    shape: tuple[int, ...]
+    dtype: str
+    packed_u32: np.ndarray | None = None
+    raw_u8: np.ndarray | None = None
+
+
+class ObservedWeightStore:
+    """Thread-safe store populated by `load_tensor` during weight streaming."""
+
+    def __init__(self) -> None:
+        """Initialize an empty thread-safe weight observation store."""
+        self._lock = threading.Lock()
+        self._entries: dict[str, ObservedMxfp4Entry] = {}
+
+    def record(self, name: str, entry: ObservedMxfp4Entry) -> None:
+        """Store an observed weight or scale entry by parameter name."""
+        with self._lock:
+            self._entries[name] = entry
+
+    def snapshot(self) -> dict[str, ObservedMxfp4Entry]:
+        """Return a shallow copy of all recorded weight entries."""
+        with self._lock:
+            return dict(self._entries)
+
+    def clear(self) -> None:
+        """Remove all recorded entries from the store."""
+        with self._lock:
+            self._entries.clear()
+
+
+WEIGHT_STORE = ObservedWeightStore()
+
+
+def observed_weights_snapshot() -> dict[str, ObservedMxfp4Entry]:
+    """Return a shallow snapshot of MXFP4 / E8M0 tensors observed at load time."""
+    return WEIGHT_STORE.snapshot()
+
+
+def clear_observed_weights() -> None:
+    """Clear the module-local MXFP4 weight observation store."""
+    WEIGHT_STORE.clear()
+
+
+def _is_fp8_cache_dtype(dtype_str: str) -> bool:
+    """Return True when the configured KV cache dtype uses FP8 storage."""
+    low = (dtype_str or "auto").lower()
+    return "fp8" in low or "float8" in low
+
+
+def _lookup_mapping_or_attr(container: object, field: str) -> object:
+    """Read a field from either a mapping or an attribute container."""
+    if isinstance(container, Mapping):
+        return container.get(field)
+    return getattr(container, field, None)
+
+
+def _extract_cfg_field(hf_cfg: object, field: str, default: object = None) -> object:
+    """Extract a configuration field from `hf_cfg` or nested `text_config`."""
+    if hf_cfg is None:
+        return default
+    direct = _lookup_mapping_or_attr(hf_cfg, field)
+    if direct is not None:
+        return direct
+    text_cfg = _lookup_mapping_or_attr(hf_cfg, "text_config")
+    if text_cfg is not None:
+        nested = _lookup_mapping_or_attr(text_cfg, field)
+        if nested is not None:
+            return nested
+    return default
+
+
+def _as_int(val: object, default: int = 0) -> int:
+    """Convert a dynamic configuration value to `int`."""
+    if isinstance(val, bool):
+        return int(val)
+    if isinstance(val, int):
+        return val
+    if isinstance(val, (float, str)):
+        return int(val)
+    return default
+
+
+def layout_request(
+    vllm_config: object, options: Mapping[str, object] | None = None
+) -> dict[str, int]:
+    """Pre-size unified MLA + KDA pool page geometry before allocation."""
+    del options
+    cache_cfg = getattr(vllm_config, "cache_config", None)
+    raw_dtype = getattr(cache_cfg, "cache_dtype", "auto")
+    cache_dtype = raw_dtype if isinstance(raw_dtype, str) and raw_dtype else "auto"
+    default_block = (
+        DEFAULT_FP8_BLOCK_SIZE
+        if _is_fp8_cache_dtype(cache_dtype)
+        else DEFAULT_BF16_BLOCK_SIZE
+    )
+    return {
+        "block_size": default_block,
+    }
+
+
+def _default_kernel_position() -> int:
+    """Resolve local worker position in ascending `device.id` order."""
+    try:
+        jax_mod = importlib.import_module("jax")
+        devices = sorted(jax_mod.devices(), key=lambda d: _as_int(getattr(d, "id", 0)))
+        if len(devices) != TPU_REQUIRED_TP_SIZE:
+            return 0
+        ids = [_as_int(getattr(d, "id", 0)) for d in devices]
+        local_devs = jax_mod.local_devices()
+        dev_id = _as_int(getattr(local_devs[0], "id", 0)) if local_devs else 0
+        if dev_id in ids:
+            return ids.index(dev_id)
+    except (ImportError, RuntimeError, ValueError, AttributeError, IndexError):
+        return 0
+    return 0
+
+
+def _resolve_kernel_position(opts: Mapping[str, object]) -> int:
+    """Return ascending-`device.id` rank position `p` in `0..31`."""
+    raw_pos = opts.get("kernel_rank", opts.get("device_position"))
+    pos = (
+        _as_int(raw_pos, default=0)
+        if raw_pos is not None
+        else _default_kernel_position()
+    )
+    if not 0 <= pos < TPU_REQUIRED_TP_SIZE:
+        msg = (
+            f"kernel_rank position must be in 0..{TPU_REQUIRED_TP_SIZE - 1}, got {pos}"
+        )
+        raise ValueError(msg)
+    return pos
+
+
+def _extract_expert_index(name: str) -> int | None:
+    """Extract per-expert integer index from parameter `name` when present."""
+    parts = name.split(".")
+    for idx, seg in enumerate(parts[:-1]):
+        if seg == "experts" and parts[idx + 1].isdigit():
+            return int(parts[idx + 1])
+    return None
+
+
+def _slice_2d_etp(mat: np.ndarray, *, part: int, is_down: bool) -> np.ndarray:
+    """Slice 1/4 ETP shard along columns (`down`) or rows (`gate`/`up`)."""
+    if is_down and mat.shape[1] % KIMI_K3_ETP_PARTS == 0:
+        width = mat.shape[1] // KIMI_K3_ETP_PARTS
+        return np.ascontiguousarray(mat[:, part * width : (part + 1) * width])
+    if not is_down and mat.shape[0] % KIMI_K3_ETP_PARTS == 0:
+        width = mat.shape[0] // KIMI_K3_ETP_PARTS
+        return np.ascontiguousarray(mat[part * width : (part + 1) * width, :])
+    return np.ascontiguousarray(mat)
+
+
+def _slice_expert_shard(
+    arr: np.ndarray,
+    *,
+    name: str,
+    position: int,
+    num_experts: int = KIMI_K3_NUM_EXPERTS,
+) -> np.ndarray | None:
+    """Slice `1/32` (`EP8 x ETP4`) shard for ascending-`device.id` position."""
+    ep_group = position // KIMI_K3_ETP_PARTS
+    part = position % KIMI_K3_ETP_PARTS
+    ep_count = max(1, num_experts // KIMI_K3_EP_GROUPS)
+    first_expert = ep_count * ep_group
+    low = name.lower()
+    is_down = "w2" in low or "down" in low
+    expert_idx = _extract_expert_index(name)
+    if expert_idx is not None:
+        if not first_expert <= expert_idx < first_expert + ep_count:
+            return None
+        return _slice_2d_etp(arr, part=part, is_down=is_down)
+    if arr.ndim == STACKED_EXPERT_NDIM and arr.shape[0] % KIMI_K3_EP_GROUPS == 0:
+        e_count = arr.shape[0] // KIMI_K3_EP_GROUPS
+        e_first = e_count * ep_group
+        sub = arr[e_first : e_first + e_count]
+        flat = sub.reshape(sub.shape[0] * sub.shape[1], sub.shape[2])
+        return _slice_2d_etp(flat, part=part, is_down=is_down)
+    if arr.ndim == PACKED_MATRIX_NDIM and arr.shape[0] % KIMI_K3_EP_GROUPS == 0:
+        ep_rows = arr.shape[0] // KIMI_K3_EP_GROUPS
+        r_first = ep_rows * ep_group
+        ep_slice = arr[r_first : r_first + ep_rows, :]
+        return _slice_2d_etp(ep_slice, part=part, is_down=is_down)
+    return _slice_2d_etp(arr, part=part, is_down=is_down)
+
+
+def load_tensor(
+    name: str, tensor: object, options: Mapping[str, object] | None = None
+) -> None:
+    """Capture `1/32` rank-sliced MXFP4 bytes and E8M0 scales before delattr."""
+    opts = dict(options) if isinstance(options, Mapping) else {}
+    if not opts.get("load_tensors", False):
+        return
+    low = name.lower()
+    is_scale = any(
+        tok in low for tok in ("weight_scale", "scale_inv", "e8m0", ".scales")
+    )
+    is_packed = any(
+        tok in low
+        for tok in ("weight_packed", "blocks", "mxfp4", "experts", "w13", "w2")
+    )
+    if not (is_scale or is_packed) or not isinstance(tensor, torch.Tensor):
+        return
+
+    position = _resolve_kernel_position(opts)
+    num_experts = _as_int(
+        opts.get("num_experts", KIMI_K3_NUM_EXPERTS),
+        default=KIMI_K3_NUM_EXPERTS,
+    )
+    t_cpu = tensor.detach().cpu()
+    dtype_name = str(t_cpu.dtype).replace("torch.", "")
+    raw_shape = tuple(t_cpu.shape)
+    if t_cpu.dtype == torch.uint8 and t_cpu.ndim in (
+        PACKED_MATRIX_NDIM,
+        STACKED_EXPERT_NDIM,
+    ):
+        shard = _slice_expert_shard(
+            t_cpu.numpy(),
+            name=name,
+            position=position,
+            num_experts=num_experts,
+        )
+        del t_cpu
+        if shard is None:
+            return
+        if is_scale:
+            scale_t = np.ascontiguousarray(shard.T).copy()
+            del shard
+            WEIGHT_STORE.record(
+                name,
+                ObservedMxfp4Entry(
+                    name=name,
+                    kind="e8m0_scale",
+                    shape=tuple(scale_t.shape),
+                    dtype=dtype_name,
+                    raw_u8=scale_t,
+                ),
+            )
+            return
+        if shard.shape[1] >= U32_PACK_FACTOR and shard.shape[1] % U32_PACK_FACTOR == 0:
+            packed = pack_expert_bytes(shard)
+            del shard
+            WEIGHT_STORE.record(
+                name,
+                ObservedMxfp4Entry(
+                    name=name,
+                    kind="mxfp4_packed",
+                    shape=tuple(packed.shape),
+                    dtype=dtype_name,
+                    packed_u32=packed,
+                ),
+            )
+            return
+        shard_shape = tuple(shard.shape)
+        del shard
+        WEIGHT_STORE.record(
+            name,
+            ObservedMxfp4Entry(
+                name=name,
+                kind="weight_meta",
+                shape=shard_shape,
+                dtype=dtype_name,
+            ),
+        )
+        return
+
+    del t_cpu
+    expert_idx = _extract_expert_index(name)
+    if expert_idx is not None:
+        ep_count = max(1, num_experts // KIMI_K3_EP_GROUPS)
+        first_expert = ep_count * (position // KIMI_K3_ETP_PARTS)
+        if not first_expert <= expert_idx < first_expert + ep_count:
+            return
+    WEIGHT_STORE.record(
+        name,
+        ObservedMxfp4Entry(
+            name=name,
+            kind="scale_meta" if is_scale else "weight_meta",
+            shape=raw_shape,
+            dtype=dtype_name,
+        ),
+    )
+
+
+def _parse_int_seq(val: object, default: Sequence[int]) -> tuple[int, ...]:
+    """Parse an integer sequence from a comma-separated string or iterable."""
+    if val is None:
+        return tuple(default)
+    if isinstance(val, str):
+        parts = [p.strip() for p in val.split(",") if p.strip()]
+        return tuple(int(p) for p in parts)
+    if isinstance(val, Iterable):
+        return tuple(_as_int(x) for x in val)
+    return (_as_int(val),)
+
+
+def _validate_hf_config(
+    hf_cfg: object,
+) -> tuple[int | None, int | None, Decline | None]:
+    """Validate Kimi K3 architecture and dimensions from HuggingFace config."""
+    if hf_cfg is None:
+        return None, None, None
+    archs = _extract_cfg_field(hf_cfg, "architectures", None)
+    model_type = _extract_cfg_field(hf_cfg, "model_type", None)
+    arch_seq = (
+        archs if isinstance(archs, Iterable) and not isinstance(archs, str) else ()
+    )
+    arch_ok = any(a in SUPPORTED_ARCHS for a in arch_seq)
+    type_ok = model_type == "kimi_k3"
+    if (archs is not None or model_type is not None) and not (arch_ok or type_ok):
+        return (
+            None,
+            None,
+            Decline(
+                "unsupported_arch",
+                f"Kimi K3 adapter does not support architectures={archs!r} "
+                f"model_type={model_type!r}",
+            ),
+        )
+    raw_layers = _extract_cfg_field(hf_cfg, "num_hidden_layers", None)
+    raw_hidden = _extract_cfg_field(hf_cfg, "hidden_size", None)
+    n_layers = _as_int(raw_layers) if raw_layers is not None else None
+    hidden = _as_int(raw_hidden) if raw_hidden is not None else None
+    if n_layers is not None and n_layers != KIMI_K3_LAYERS:
+        return (
+            n_layers,
+            hidden,
+            Decline(
+                "invalid_geometry",
+                f"expected {KIMI_K3_LAYERS} layers, got {n_layers}",
+            ),
+        )
+    if hidden is not None and hidden != KIMI_K3_HIDDEN_SIZE:
+        return (
+            n_layers,
+            hidden,
+            Decline(
+                "invalid_geometry",
+                f"expected hidden_size={KIMI_K3_HIDDEN_SIZE}, got {hidden}",
+            ),
+        )
+    return n_layers, hidden, None
+
+
+def _validate_tpu_topology(
+    view: RunnerView,
+    opts: Mapping[str, object],
+    tp_size: int,
+    attention_dp: int,
+    geometry: tuple[int | None, int | None],
+    observed_weights: Mapping[str, ObservedMxfp4Entry],
+) -> Decline | None:
+    """Validate TPU-specific Kimi K3 parallelism, weights, and decoder state."""
+    n_layers, hidden = geometry
+    par_cfg = getattr(view.vllm_config, "parallel_config", None)
+    dcp_raw = getattr(par_cfg, "decode_context_parallel_size", None)
+    dcp_size = _as_int(dcp_raw) if dcp_raw is not None else None
+    expected_dcp = TPU_REQUIRED_TP_SIZE // max(1, attention_dp)
+    checks: tuple[tuple[bool, str, str], ...] = (
+        (
+            n_layers is None or hidden is None,
+            "invalid_geometry",
+            "missing num_hidden_layers or hidden_size on TPU",
+        ),
+        (
+            tp_size != TPU_REQUIRED_TP_SIZE,
+            "unsupported_tp_size",
+            f"Kimi K3 TPU megakernel requires tp_size == {TPU_REQUIRED_TP_SIZE}, "
+            f"got {tp_size}",
+        ),
+        (
+            attention_dp not in SUPPORTED_ATTENTION_DP_SIZES,
+            "unsupported_attention_dp",
+            "Kimi K3 attention_dp on TPU must be in "
+            f"{SUPPORTED_ATTENTION_DP_SIZES}, got {attention_dp}",
+        ),
+        (
+            dcp_size is not None and dcp_size > 1 and dcp_size != expected_dcp,
+            "unsupported_dcp_size",
+            f"expected decode_context_parallel_size == {expected_dcp}, got {dcp_size}",
+        ),
+        (
+            view.model is None and not opts.get("presharded"),
+            "backbone_not_found",
+            "Kimi K3 TPU megakernel requires a loaded model",
+        ),
+        (
+            bool(opts.get("require_observed_mxfp4", False)) and not observed_weights,
+            "missing_mxfp4_weights",
+            "no MXFP4 weights captured by load_tensor prior to create()",
+        ),
+    )
+    for failed, code, msg in checks:
+        if failed:
+            return Decline(code, msg)
+    return Decline(
+        "runner_lifecycle_unwired",
+        "Kimi K3 TPU serving requires single-copy weight ownership, "
+        "ascending-id mesh, SlotMap lifecycle, and Option 2b StepOutput hooks",
+    )
+
+
+def _resolve_buckets(
+    opts: Mapping[str, object],
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Resolve sorted decode and verify bucket tuples from plugin options."""
+    decode_buckets = tuple(
+        sorted(
+            {
+                b
+                for b in _parse_int_seq(opts.get("buckets"), DEFAULT_DECODE_BUCKETS)
+                if b > 0
+            }
+        )
+    )
+    raw_verify = opts.get("verify_buckets", DEFAULT_VERIFY_BUCKETS)
+    if raw_verify in ((), [], "none", False):
+        verify_buckets: tuple[int, ...] = ()
+    elif isinstance(raw_verify, str):
+        verify_buckets = parse_mk_verify_buckets(
+            raw_verify, verify_tokens=(VERIFY_TOKEN_COUNT,)
+        )
+    elif isinstance(raw_verify, Iterable):
+        verify_buckets = tuple(
+            sorted(
+                {
+                    _as_int(b)
+                    for b in raw_verify
+                    if _as_int(b) >= VERIFY_TOKEN_COUNT
+                    and _as_int(b) % VERIFY_TOKEN_COUNT == 0
+                }
+            )
+        )
+    else:
+        verify_buckets = ()
+    return decode_buckets, verify_buckets
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class KimiK3ProgramConfig:
+    """Resolved configuration bundle for `KimiK3MonoProgram`."""
+
+    tp_rank: int
+    tp_size: int
+    attention_dp: int
+    hidden_size: int
+    decode_buckets: tuple[int, ...]
+    verify_buckets: tuple[int, ...]
+    max_slots: int
+    is_tpu: bool
+    options: Mapping[str, object]
+    view: RunnerView | None = None
+    observed_weights: Mapping[str, ObservedMxfp4Entry] = dataclasses.field(
+        default_factory=dict
+    )
+
+
+def create(
+    view: RunnerView, options: Mapping[str, object]
+) -> KimiK3MonoProgram | Decline:
+    """Validate Kimi K3 topology, snapshot observed weights, and clear store."""
+    observed = observed_weights_snapshot()
+    try:
+        opts = dict(options or {})
+        hf_cfg = view.hf_config
+        n_layers, hidden, hf_decline = _validate_hf_config(hf_cfg)
+        if hf_decline is not None:
+            return hf_decline
+
+        raw_dev_type = getattr(view.device, "type", "cpu")
+        dev_type = (raw_dev_type if isinstance(raw_dev_type, str) else "cpu").lower()
+        is_tpu = dev_type == "tpu"
+        tp_size = view.tp_size
+        par_cfg = getattr(view.vllm_config, "parallel_config", None)
+        if not is_tpu and tp_size == 0:
+            tp_size = _as_int(getattr(par_cfg, "tensor_parallel_size", 1), default=1)
+        default_dp = _as_int(getattr(par_cfg, "data_parallel_size", 2), default=2)
+        attention_dp = _as_int(opts.get("attention_dp", default_dp), default=2)
+
+        if is_tpu:
+            tpu_decline = _validate_tpu_topology(
+                view,
+                opts,
+                tp_size,
+                attention_dp,
+                (n_layers, hidden),
+                observed,
+            )
+            if tpu_decline is not None:
+                return tpu_decline
+        elif tp_size not in SUPPORTED_CPU_TP_SIZES:
+            return Decline(
+                "unsupported_tp_size",
+                f"CPU test runner tp_size={tp_size} outside {SUPPORTED_CPU_TP_SIZES}",
+            )
+
+        decode_buckets, verify_buckets = _resolve_buckets(opts)
+        if not decode_buckets and not verify_buckets:
+            return Decline("empty_buckets", "no decode or verify buckets configured")
+
+        default_hidden = (
+            _as_int(
+                _extract_cfg_field(hf_cfg, "hidden_size", KIMI_K3_HIDDEN_SIZE),
+                default=KIMI_K3_HIDDEN_SIZE,
+            )
+            if hf_cfg is not None
+            else KIMI_K3_HIDDEN_SIZE
+        )
+        hidden_size = _as_int(
+            opts.get("synthetic_hidden_size", default_hidden), default=default_hidden
+        )
+        max_slots = _as_int(
+            opts.get("max_slots", DEFAULT_MAX_SLOTS), default=DEFAULT_MAX_SLOTS
+        )
+
+        return KimiK3MonoProgram(
+            KimiK3ProgramConfig(
+                tp_rank=view.tp_rank,
+                tp_size=tp_size,
+                attention_dp=max(1, attention_dp),
+                hidden_size=hidden_size,
+                decode_buckets=decode_buckets,
+                verify_buckets=verify_buckets,
+                max_slots=max_slots,
+                is_tpu=is_tpu,
+                options=opts,
+                view=view,
+                observed_weights=observed,
+            )
+        )
+    finally:
+        clear_observed_weights()
+
+
+class KimiK3MonoProgram:
+    """MonoProgram wrapping Kimi K3 decoder stack, unified pools, and SlotMap."""
+
+    def __init__(self, config: KimiK3ProgramConfig) -> None:
+        """Initialize the Kimi K3 MonoProgram from a validated configuration."""
+        self.tp_rank = config.tp_rank
+        self.tp_size = config.tp_size
+        self.attention_dp = config.attention_dp
+        self.hidden_size = config.hidden_size
+        self.decode_buckets = config.decode_buckets
+        self.verify_buckets = config.verify_buckets
+        self.is_tpu = config.is_tpu
+        self.options = dict(config.options)
+        self.slot_map = SlotMap(num_slots=config.max_slots, groups=config.attention_dp)
+        self.warmed: list[tuple[int, int]] = []
+        self.mesh: object = None
+        self.observed_weights: dict[str, ObservedMxfp4Entry] = dict(
+            config.observed_weights
+        )
+        self.decoder: object = None
+        self.bound_pools: object = None
+        self.bucket_out_rows: dict[tuple[int, int], int] = {}
+        prof_ns = dataclasses.make_dataclass(
+            "KimiBucketProfile",
+            [("buckets", tuple[int, ...]), ("verify_buckets", tuple[int, ...])],
+        )(buckets=config.decode_buckets, verify_buckets=config.verify_buckets)
+        spec_toks = _as_int(getattr(config.view, "speculative_tokens", 0), default=0)
+        verify_toks = (
+            (VERIFY_TOKEN_COUNT,)
+            if spec_toks == DEFAULT_SPECULATIVE_TOKENS
+            or bool(self.options.get("enable_verify_bucket", False))
+            else ()
+        )
+        raw_paddings = (
+            (getattr(config.view, "token_paddings", ()) or ())
+            if config.view is not None
+            else ()
+        )
+        token_paddings = tuple(
+            sorted(_as_int(p) for p in raw_paddings if _as_int(p) > 0)
+        )
+        self.policy = BucketPolicy.resolve(
+            prof_ns, verify_tokens=verify_toks, token_paddings=token_paddings
+        )
+
+    def admit_requests(
+        self,
+        active_req_ids: Sequence[str],
+        finished_req_ids: Iterable[str] = (),
+        *,
+        group: int = 0,
+    ) -> list[int]:
+        """Release finished requests and allocate non-null SlotMap slots."""
+        self.slot_map.release(finished_req_ids)
+        return [
+            self.slot_map.allocate(req_id, group=group) for req_id in active_req_ids
+        ]
+
+    def buckets(self, token_paddings: Sequence[int]) -> Sequence[Bucket]:
+        """Return decode and verify compilation buckets aligned to token paddings."""
+        pads = sorted(p for p in token_paddings if p > 0)
+
+        def _out_rows(b: int) -> int:
+            """Compute padded output row count for bucket size `b`."""
+            for p in pads:
+                if p >= b:
+                    return p
+            return max(
+                MIN_OUT_ROW_ALIGNMENT,
+                -(-b // MIN_OUT_ROW_ALIGNMENT) * MIN_OUT_ROW_ALIGNMENT,
+            )
+
+        result: list[Bucket] = []
+        self.bucket_out_rows.clear()
+        for b in self.decode_buckets:
+            out_r = _out_rows(b)
+            bkt = Bucket(1, b, out_r)
+            result.append(bkt)
+            self.bucket_out_rows[bkt.key] = out_r
+        for vb in self.verify_buckets:
+            out_r = _out_rows(vb)
+            bkt = Bucket(VERIFY_TOKEN_COUNT, vb, out_r)
+            result.append(bkt)
+            self.bucket_out_rows[bkt.key] = out_r
+        return result
+
+    def load(self, mesh: object) -> None:
+        """Bind the runtime mesh and flush any remaining observed weights."""
+        self.mesh = mesh
+        latest = observed_weights_snapshot()
+        if latest:
+            self.observed_weights.update(latest)
+        clear_observed_weights()
+
+    def bind(self, view: RunnerView) -> dict[str, int]:
+        """Validate unified MLA and KDA cache layout and return pool geometry."""
+        vllm_cfg = view.vllm_config
+        cache_cfg = getattr(vllm_cfg, "cache_config", None)
+        raw_block = view.cache_block_size
+        if raw_block is None and cache_cfg is not None:
+            raw_block = getattr(cache_cfg, "block_size", None)
+
+        block_size = (
+            _as_int(raw_block, default=DEFAULT_BF16_BLOCK_SIZE)
+            if raw_block is not None
+            else DEFAULT_BF16_BLOCK_SIZE
+        )
+        raw_dtype = getattr(cache_cfg, "cache_dtype", "auto")
+        cache_dtype = raw_dtype if isinstance(raw_dtype, str) and raw_dtype else "auto"
+        expected_layout = FP8_LAYOUT if _is_fp8_cache_dtype(cache_dtype) else LAYOUT
+        if block_size != expected_layout.tokens_per_block:
+            req_blk = expected_layout.tokens_per_block
+            raise LayoutDecline(
+                EligibilityResult(
+                    eligible=False,
+                    reason="unaligned_cache_layout",
+                    message=(
+                        "unaligned_cache_layout: Kimi K3 unified KV+KDA pool "
+                        f"requires block_size={req_blk}, got {block_size}"
+                    ),
+                )
+            )
+
+        par_cfg = getattr(vllm_cfg, "parallel_config", None)
+        interleave = (
+            getattr(par_cfg, "cp_kv_cache_interleave_size", None)
+            if par_cfg is not None
+            else None
+        )
+
+        if interleave is not None and _as_int(interleave) != block_size:
+            raise LayoutDecline(
+                EligibilityResult(
+                    eligible=False,
+                    reason="unaligned_cache_layout",
+                    message=(
+                        "unaligned_cache_layout: "
+                        f"cp_kv_cache_interleave_size={interleave} "
+                        f"must equal block_size={block_size}"
+                    ),
+                )
+            )
+
+        return {
+            "block_size": block_size,
+            "entry_width": KIMI_K3_POOL_ENTRY_WIDTH,
+            "tokens_per_row": expected_layout.tokens_per_row,
+            "mla_pools": KIMI_K3_MLA_POOLS,
+            "kda_layers": KIMI_K3_KDA_LAYERS,
+        }
+
+    def build(self, bucket: Bucket) -> StepFn:
+        """Build a CPU-only contract-test step callable for `bucket`."""
+        if self.is_tpu:
+            msg = (
+                "KimiK3MonoProgram contract step callable is CPU-only and "
+                "cannot be built for TPU"
+            )
+            raise RuntimeError(msg)
+        out_rows = bucket.out_rows if bucket.out_rows is not None else bucket.B
+        hidden = self.hidden_size
+
+        def step_fn(input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+            """Execute one bucketed CPU contract-test forward step."""
+            dev = input_ids.device
+            if dev.type != "cpu":
+                msg = (
+                    "KimiK3MonoProgram contract step callable is CPU-only; "
+                    f"got device={dev}"
+                )
+                raise RuntimeError(msg)
+            tok_f = input_ids.to(dtype=torch.float32).unsqueeze(-1)
+            pos_f = positions.to(dtype=torch.float32).unsqueeze(-1)
+            row_val = (tok_f * 0.015625 + pos_f * 0.00390625).to(dtype=torch.bfloat16)
+            out = torch.zeros((out_rows, hidden), dtype=torch.bfloat16, device=dev)
+            n = min(int(row_val.shape[0]), out_rows)
+            out[:n, :] = row_val[:n].expand(n, hidden)
+            return out
+
+        return step_fn
+
+    def warmup_inputs(self, bucket: Bucket, shape: RunnerShape) -> WarmupCase:
+        """Construct synthetic warmup inputs and output validator for `bucket`."""
+        del shape
+        b_len = bucket.B
+        out_rows = bucket.out_rows if bucket.out_rows is not None else b_len
+        dev = torch.device("tpu") if self.is_tpu else torch.device("cpu")
+        ids = torch.ones((b_len,), dtype=torch.int32, device=dev)
+        pos = torch.arange(b_len, dtype=torch.int32, device=dev)
+        key = bucket.key
+
+        def _check(out: torch.Tensor) -> None:
+            """Verify warmup output tensor dimensions and record warmed key."""
+            out_shape = tuple(out.shape)
+            expected_shape = (out_rows, self.hidden_size)
+            if out_shape != expected_shape:
+                msg = f"warmup output shape {out_shape} != {expected_shape}"
+                raise AssertionError(msg)
+            self.warmed.append(key)
+
+        return WarmupCase(args=(ids, pos), check=_check)
+
+    def _extract_attn_pair_and_admit(self, md: object) -> tuple[object, object]:
+        """Extract `(mla_md, kda_md)` from attention metadata and admit requests."""
+        if not isinstance(md, Mapping):
+            return None, None
+        mla_md = md.get("mla")
+        kda_md = md.get("kda_0")
+        for k, val in md.items():
+            key_low = str(k).lower()
+            if mla_md is None and "mla" in key_low:
+                mla_md = val
+            elif kda_md is None and ("kda" in key_low or "mamba" in key_low):
+                kda_md = val
+        if mla_md is None and md:
+            mla_md = next(iter(md.values()))
+        req_ids = md.get("req_ids")
+        fin_ids = md.get("finished_req_ids", ())
+        if isinstance(req_ids, Sequence) and not isinstance(req_ids, (str, bytes)):
+            fin_iter = (
+                fin_ids
+                if isinstance(fin_ids, Iterable)
+                and not isinstance(fin_ids, (str, bytes))
+                else ()
+            )
+            self.admit_requests(
+                [str(r) for r in req_ids],
+                [str(f) for f in fin_iter],
+            )
+        return mla_md, kda_md
+
+    def decide(self, ctx: object, fwd: ForwardView) -> StepDecision | None:
+        """Evaluate step eligibility and select the target bucket."""
+        input_ids = getattr(ctx, "input_ids", None)
+        positions = getattr(ctx, "positions", None)
+        if not isinstance(input_ids, torch.Tensor) or positions is None:
+            return None
+        mla_md, kda_md = self._extract_attn_pair_and_admit(fwd.attn_metadata or {})
+        b_shape = fwd.batch_shape(mla_md, kda_md)
+        if not b_shape.eligible and b_shape.reason.startswith("stock_q"):
+            try:
+                q = int(b_shape.reason[len("stock_q") :])
+                if q in self.policy.verify_tokens:
+                    b_shape = BatchShape(
+                        eligible=True,
+                        num_reqs=b_shape.num_reqs,
+                        tokens_per_seq=q,
+                        reason="ok",
+                    )
+            except (ValueError, TypeError):
+                pass
+        return check_step_eligibility(
+            b_shape,
+            self.policy,
+            compiled_buckets=set(fwd.steps.keys()),
+            bucket_out_rows=self.bucket_out_rows,
+            input_rows=int(input_ids.shape[0]),
+        )
+
+    def forward(
+        self, decision: StepDecision | None, ctx: object, fwd: ForwardView
+    ) -> torch.Tensor:
+        """Run the compiled bucket step callable and slice to active tokens."""
+        if decision is None:
+            decision = self.decide(ctx, fwd)
+        if decision is None or not decision.eligible:
+            msg = "KimiK3MonoProgram.forward invoked on ineligible step"
+            raise RuntimeError(msg)
+        key = (decision.tokens_per_seq, decision.bucket_t)
+        step_fn = fwd.steps[key]
+        raw_ids = getattr(ctx, "input_ids", None)
+        raw_pos = getattr(ctx, "positions", None)
+        if not isinstance(raw_ids, torch.Tensor) or not isinstance(
+            raw_pos, torch.Tensor
+        ):
+            msg = "KimiK3MonoProgram.forward requires tensor input_ids and positions"
+            raise TypeError(msg)
+        ids = raw_ids
+        pos = raw_pos
+        target_b = decision.bucket_t
+        cur_n = int(ids.shape[0])
+        if cur_n < target_b:
+            pad_n = target_b - cur_n
+            ids = torch.cat(
+                [ids, torch.zeros((pad_n,), dtype=ids.dtype, device=ids.device)], dim=0
+            )
+            pos = torch.cat(
+                [pos, torch.zeros((pad_n,), dtype=pos.dtype, device=pos.device)], dim=0
+            )
+        elif cur_n > target_b:
+            ids = ids[:target_b]
+            pos = pos[:target_b]
+        out = step_fn(ids, pos)
+        n_out = fwd.num_tokens if fwd.num_tokens is not None else cur_n
+        return out[:n_out]
+
+
+__all__ = [
+    "KimiK3MonoProgram",
+    "KimiK3ProgramConfig",
+    "ObservedMxfp4Entry",
+    "clear_observed_weights",
+    "create",
+    "layout_request",
+    "load_tensor",
+    "observed_weights_snapshot",
+]

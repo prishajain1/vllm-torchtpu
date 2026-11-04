@@ -14,3 +14,7 @@
 """Kimi K3 megakernel package."""
 
 from __future__ import annotations
+
+from .spec import SPEC
+
+__all__ = ["SPEC"]
