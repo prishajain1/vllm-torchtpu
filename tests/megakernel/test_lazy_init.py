@@ -96,3 +96,20 @@ print("root_imports_jax" if root_jax else "no_jax")
 def test_package_import_loads_no_megakernel_submodule() -> None:
     """With jax importable, importing the packages imports no heavy submodule."""
     assert _run(_LAZY_ONLY.format(heavy=_HEAVY)) in ("root_imports_jax", "no_jax")
+
+
+_FIRST_LOOKUP = """
+from vllm_torchtpu import megakernel as mk
+# The first lookup can be a profile one: `profile` builds DEFAULT_PROFILE
+# (a module-tunables lookup) while it is itself being imported.
+assert mk.get_profile("default").numerics == "exact"
+mk.register_profile(
+    mk.Profile(name="test-approx-profile", numerics="approx", fused_pool_io=True)
+)
+assert mk.get_profile("test-approx-profile").numerics == "approx"
+print("OK")
+"""
+
+
+def test_first_lookup_is_a_profile_lookup() -> None:
+    assert _run(_FIRST_LOOKUP) == "OK"

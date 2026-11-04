@@ -61,7 +61,7 @@ def _derive_required_modules(
     return required
 
 
-_LAZY_IMPORTERS = frozenset({"__init__.py", "dma/__init__.py"})
+_LAZY_IMPORTERS = frozenset({"__init__.py", "dma/__init__.py", "_builtins.py"})
 
 
 def test_megakernel_portability_ast_guard():
@@ -96,8 +96,8 @@ def test_megakernel_portability_ast_guard():
                     if isinstance(func, ast.Name)
                     else (func.attr if isinstance(func, ast.Attribute) else None)
                 )
-                # The lazy (PEP 562) package namespaces import their own
-                # submodules by name.
+                # The lazy (PEP 562) package namespaces and the built-in
+                # registrations import their own submodules by name.
                 if rel in _LAZY_IMPORTERS and func_name == "import_module":
                     continue
                 assert func_name not in {"__import__", "import_module"}, (

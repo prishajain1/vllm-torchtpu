@@ -77,10 +77,20 @@ class Tiles:
     dense_acc_pair: bool = False  # Unrolled / paired dense matmul accumulation
     dmm_unroll: int = 0  # Max tiles to fully unroll in dmatmul (0: never)
     rel_fetch: bool = False  # Trace-time-decoded dense refills (fetch_rel/flush_rel)
+    collective_id: int = 0  # Pallas TPU collective_id when R > 1
     # Per-module tunables (registered `Tunables` instances keyed by module name).
     modules: Mapping[str, Any] = TunablesMap()
 
     def __post_init__(self) -> None:
+        if (
+            not isinstance(self.collective_id, int)
+            or isinstance(self.collective_id, bool)
+            or self.collective_id < 0
+        ):
+            raise ValueError(
+                "Tiles.collective_id must be a non-negative int, "
+                f"got {self.collective_id!r}"
+            )
         if not isinstance(self.modules, TunablesMap):
             object.__setattr__(self, "modules", TunablesMap(self.modules))
 
@@ -140,6 +150,7 @@ TILE_NUMERICS: dict[str, NumericsClass] = {
     "dense_acc_pair": "approx",  # paired dense accumulation
     "dmm_unroll": "approx",  # unrolled dense matmul accumulation
     "rel_fetch": "exact",  # trace-time-decoded dense refills (scheduling)
+    "collective_id": "exact",  # Pallas TPU collective_id tag
 }
 
 
@@ -165,10 +176,31 @@ def default_tiles(B: int, **kw: Any) -> Tiles:
 
 @dataclass(frozen=True)
 class DebugOptions:
-    """Debug and ablation flags kept separate from model geometry and execution."""
+    """Debug, ablation, and LLO profiling flags (`ExecSpec.debug`).
+
+    `scopes` controls `jax.named_scope` LLO region markers (`sc(name, level)` is
+    enabled when `int(scopes) >= level`):
+    - `0` / `False`: off (default; zero LLO instructions emitted).
+    - `1` / `True`: per-module hook scopes `<module>/<phase>` around every module's
+      `prologue`, `init_buffers`, `on_layer_start`, `emit`, and `epilogue`, plus
+      `pltpu.trace_value("layer", lyr)` inside `<module>/emit`.
+    - `2`: phase scopes (`sc(name)` default `level=2`, e.g. `norm_in`, `smalls_sync`,
+      `allreduce`, `final_norm`, and intra-module phase scopes).
+    - `3`: fine-grained DMA wait and routing scopes (`dwait`, `ewait`, `swait`,
+      `route_topk`, `route_dma`, `route_dedup`, `route_fetch`).
+
+    Capturing custom-call LLO scopes in xprof on TPU requires enabling LLO profiling
+    in the XLA TPU compiler: pass `compiler_options={"xla_tpu_enable_llo_profiling":
+    "true"}` to `pl.pallas_call` or set `LIBTPU_INIT_ARGS` with
+    `--xla_tpu_enable_llo_profiling=true` (optionally with
+    `--xla_xprof_enable_custom_call_tracing=true` and
+    `--xla_xprof_register_llo_debug_info=true`). In the captured `.xplane.pb`, scope
+    events and `"layer"` (`int_value` = layer index `0..L-1` from `pltpu.trace_value`)
+    appear on the `/device:TPU:*` plane's `"XLA TraceMe"` line.
+    """
 
     skip: frozenset[str] = frozenset()  # Named execution phases to skip during ablation
-    scopes: int | bool = False  # Emit per-phase jax.named_scope annotations
+    scopes: int | bool = False  # 0/False off, 1/True module, 2 phase, 3 wait/route
     # Per-module debug flags (registered `Debug` dataclasses keyed by module name).
     # Kept out of `Tiles`, so setting them leaves `ExecSpec.tiles=None` (and its
     # build-time VMEM refinement) intact.
@@ -203,8 +235,18 @@ class ExecSpec:
     # using plain states without page tables; one equal to its own defaults is
     # stored as None). Core execution config never reads it.
     cache: Any = None
+    collective_id: int | None = None  # Overrides Tiles.collective_id when set
 
     def __post_init__(self) -> None:
+        if self.collective_id is not None and (
+            not isinstance(self.collective_id, int)
+            or isinstance(self.collective_id, bool)
+            or self.collective_id < 0
+        ):
+            raise ValueError(
+                "ExecSpec.collective_id must be a non-negative int or None, "
+                f"got {self.collective_id!r}"
+            )
         cx = self.cache
         if (
             dataclasses.is_dataclass(cx)
@@ -216,6 +258,14 @@ class ExecSpec:
     @property
     def resolved_tiles(self) -> Tiles:
         return self.tiles if self.tiles is not None else default_tiles(self.B, R=self.R)
+
+    @property
+    def resolved_collective_id(self) -> int:
+        return (
+            self.collective_id
+            if self.collective_id is not None
+            else self.resolved_tiles.collective_id
+        )
 
     def resolve_tiles(self, g: Any = None) -> Tiles:
         """Same as `resolved_tiles` (`g` kept for callers; the defaults ignore it)."""

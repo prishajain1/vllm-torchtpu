@@ -34,9 +34,20 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
         spec,
     )
     from .dma import pool_alias
-    from .errors import MegakernelConfigError, MegakernelLayoutError
-    from .exec_spec import DebugOptions, ExecSpec, Tiles, default_tiles
-    from .ops import col_chunk, rup
+    from .errors import (
+        MegakernelConfigError,
+        MegakernelLayoutError,
+    )
+    from .exec_spec import (
+        DebugOptions,
+        ExecSpec,
+        Tiles,
+        default_tiles,
+    )
+    from .ops import (
+        col_chunk,
+        rup,
+    )
     from .planner import encode_ecopy
     from .pool import (
         POOL_STATE_NAME,
@@ -59,6 +70,7 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
         DEFAULT_PROFILE,
         Baseline,
         Profile,
+        TileContext,
         TileRule,
         get_profile,
         list_profiles,
@@ -67,6 +79,7 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
     )
     from .spec import (
         REQUIRED,
+        CompareMode,
         ExtraInput,
         FrozenDict,
         HFParamDecl,
@@ -75,6 +88,8 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
         ModelSpec,
         Module,
         ModuleBinding,
+        OutputRole,
+        ParamInit,
         ParamTransform,
         RecurrentCacheDecl,
         ResolvedModuleGeometry,
@@ -133,12 +148,14 @@ _LAZY: dict[str, str] = {
     "DEFAULT_PROFILE": ".profile",
     "Baseline": ".profile",
     "Profile": ".profile",
+    "TileContext": ".profile",
     "TileRule": ".profile",
     "get_profile": ".profile",
     "list_profiles": ".profile",
     "model_default_profile": ".profile",
     "register_profile": ".profile",
     "REQUIRED": ".spec",
+    "CompareMode": ".spec",
     "ExtraInput": ".spec",
     "FrozenDict": ".spec",
     "HFParamDecl": ".spec",
@@ -147,6 +164,8 @@ _LAZY: dict[str, str] = {
     "ModelSpec": ".spec",
     "Module": ".spec",
     "ModuleBinding": ".spec",
+    "OutputRole": ".spec",
+    "ParamInit": ".spec",
     "ParamTransform": ".spec",
     "RecurrentCacheDecl": ".spec",
     "ResolvedModuleGeometry": ".spec",
@@ -166,6 +185,7 @@ __all__ = [
     "REQUIRED",
     "Baseline",
     "CacheExec",
+    "CompareMode",
     "DebugOptions",
     "ExecSpec",
     "ExtraInput",
@@ -178,6 +198,8 @@ __all__ = [
     "ModelSpec",
     "Module",
     "ModuleBinding",
+    "OutputRole",
+    "ParamInit",
     "ParamTransform",
     "PoolBackend",
     "PoolLayout",
@@ -189,6 +211,7 @@ __all__ = [
     "Spec",
     "StateDecl",
     "SwitchSlot",
+    "TileContext",
     "TileRule",
     "Tiles",
     "VLLMAlias",
