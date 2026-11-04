@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from vllm_torchtpu.megakernel.advisor import (
         AdvisorReport,
         AdvisorSweepReport,
+        RegimeEntry,
     )
 
 _MOE_MODE_SHORT_HINTS: Mapping[str, str] = {
@@ -48,6 +49,8 @@ _SCOPE_HINTS: Mapping[str, str] = {
     "single_layer": "one call per layer",
     "per_op": "one call per operator; activations hand off through HBM",
 }
+_PROVENANCE_TAGS: tuple[str, ...] = ("FACT", "DERIVED", "ASSUMED", "MEASURED")
+_BAND_PAIR_LEN = 2
 
 
 def _esc(val: object) -> str:
@@ -430,11 +433,118 @@ def render_regime_dot_plot_svg(sweep: AdvisorSweepReport) -> str:
     return "\n".join(parts)
 
 
+def render_step_band_svg(sweep: AdvisorSweepReport) -> str:
+    """Render horizontal one-sided upward uncertainty whiskers for each regime."""
+    regimes = sweep.regimes
+    pad, gap, row_h, plot_w = 12.0, 14.0, 26.0, 440.0
+    label_w = max(svg_text_width(e.label) for e in regimes)
+    right = [
+        f"{e.step_bound_us:,.1f}..{max(e.step_bound_us, e.step_upper_us):,.1f} us"
+        for e in regimes
+    ]
+    right_w = max(svg_text_width(t) for t in right)
+    x0 = pad + label_w + gap
+    x1 = x0 + plot_w
+    max_us = max(
+        10.0,
+        *(max(e.step_bound_us, e.step_upper_us) for e in regimes),
+    )
+    log_max = math.log10(max_us)
+
+    def sx_us(val_us: float) -> float:
+        """Map latency in microseconds to horizontal log10 coordinate."""
+        clamped = max(1.0, float(val_us))
+        return x0 + (math.log10(clamped) / max(1.0, log_max)) * plot_w
+
+    title = "One-sided upward step latency bands: hardware floor to upper bound (us)"
+    width = max(
+        x1 + gap + right_w + pad,
+        pad + svg_text_width(title, 15) + pad,
+    )
+    top = 36.0
+    bottom = top + row_h * len(regimes)
+    height = bottom + 36.0
+
+    parts = [
+        f'<svg viewBox="0 0 {width:.0f} {height:.0f}" class="chart-svg" '
+        'xmlns="http://www.w3.org/2000/svg" role="img">',
+        f'<rect x="0" y="0" width="{width:.0f}" height="{height:.0f}" fill="#0f172a"/>',
+        f'<text x="{pad}" y="22" font-size="15" font-weight="600" '
+        f'fill="#f8fafc">{_esc(title)}</text>',
+    ]
+    for idx, (entry, rtext) in enumerate(zip(regimes, right)):
+        cy = top + row_h * idx + row_h / 2
+        lo = float(entry.step_bound_us)
+        hi = max(lo, float(entry.step_upper_us))
+        x_lo = sx_us(lo)
+        x_hi = max(x_lo, sx_us(hi))
+        color, _ = _SCOPE_MARKS.get(entry.recommended_scope, ("#38bdf8", "circle"))
+        parts.append(
+            f'<line x1="{x0:.1f}" y1="{cy:.1f}" x2="{x1:.1f}" y2="{cy:.1f}" '
+            'stroke="#334155" stroke-width="1"/>'
+        )
+        parts.append(_svg_text(x0 - gap / 2, cy + 4.5, entry.label, anchor="end"))
+        parts.append(
+            f'<line class="uncertainty-whisker" data-floor="{lo:.2f}" '
+            f'data-upper="{hi:.2f}" x1="{x_lo:.2f}" y1="{cy:.2f}" '
+            f'x2="{x_hi:.2f}" y2="{cy:.2f}" stroke="{color}" stroke-width="3"/>'
+        )
+        parts.append(
+            f'<circle cx="{x_lo:.2f}" cy="{cy:.2f}" r="4.5" fill="{color}" '
+            'stroke="#0f172a" stroke-width="1.2"/>'
+        )
+        parts.append(_svg_text(x1 + gap, cy + 4.5, rtext))
+    parts.append("</svg>")
+    return "\n".join(parts)
+
+
+def _render_provenance_cell(entry: RegimeEntry) -> str:
+    """Render provenance tag counts and collapsible metric breakdown table."""
+    counts = dict.fromkeys(_PROVENANCE_TAGS, 0)
+    detail_rows: list[str] = []
+    for m_name, m_val in entry.metrics.items():
+        tag = str(m_val["tag"])
+        if tag in counts:
+            counts[tag] += 1
+        band = m_val["band"]
+        band_str = f"[{band[0]}, {band[1]}]" if len(band) >= _BAND_PAIR_LEN else "[]"
+        detail_rows.append(
+            "<tr>"
+            f"<td><code>{_esc(m_name)}</code></td>"
+            f'<td><span class="prov-tag prov-tag-{_esc(tag)}">{_esc(tag)}</span></td>'
+            f"<td>{_esc(m_val['value'])}</td>"
+            f"<td>{_esc(m_val['unit'])}</td>"
+            f"<td>{_esc(band_str)}</td>"
+            f"<td>{_esc(m_val['source'])}</td>"
+            "</tr>"
+        )
+    badges = " ".join(
+        f'<span class="prov-tag prov-tag-{tag}">{tag}: {counts[tag]}</span>'
+        for tag in _PROVENANCE_TAGS
+    )
+    table_html = (
+        '<details class="prov-details"><summary>Breakdown</summary>'
+        "<table><thead><tr>"
+        "<th>name</th><th>tag</th><th>value</th>"
+        "<th>unit</th><th>band</th><th>source</th>"
+        f"</tr></thead><tbody>{''.join(detail_rows)}</tbody></table></details>"
+    )
+    return f"<div>{badges}</div>{table_html}"
+
+
+def _render_flags_cell(entry: RegimeEntry) -> str:
+    """Render pill badges for non-empty regime flags."""
+    if not entry.flags:
+        return '<span class="kpi-sub">none</span>'
+    return " ".join(f'<span class="flag-pill">{_esc(fl)}</span>' for fl in entry.flags)
+
+
 def render_advisor_html(sweep: AdvisorSweepReport) -> str:
     """Render a self-contained, zero-CDN HTML report with inline SVG regime charts."""
     rec = sweep.parallelism
     vmem_svg = _render_vmem_svg(sweep)
     regime_svg = render_regime_dot_plot_svg(sweep)
+    band_svg = render_step_band_svg(sweep)
     safe_json = json.dumps(sweep.to_dict(), indent=2).replace("</", "<\\/")
 
     rows_html = []
@@ -442,6 +552,9 @@ def render_advisor_html(sweep: AdvisorSweepReport) -> str:
         scope = _esc(entry.recommended_scope)
         moe_mode = entry.recommended_moe_mode
         moe_hint = _esc(_MOE_MODE_SHORT_HINTS.get(moe_mode, ""))
+        hi_us = max(entry.step_bound_us, entry.step_upper_us)
+        prov_cell = _render_provenance_cell(entry)
+        flags_cell = _render_flags_cell(entry)
         rows_html.append(
             "<tr>"
             f"<td><strong>{_esc(entry.label)}</strong></td>"
@@ -452,7 +565,10 @@ def render_advisor_html(sweep: AdvisorSweepReport) -> str:
             f'<td><span class="badge badge-{scope}">{scope}</span></td>'
             f"<td><code>{_esc(moe_mode)}</code>"
             f'<div class="kpi-sub">{moe_hint}</div></td>'
-            f"<td>{entry.step_bound_us:.1f}</td>"
+            f"<td>{entry.step_bound_us:.1f}"
+            f'<div class="kpi-sub">upper: {hi_us:.1f} us</div></td>'
+            f"<td>{prov_cell}</td>"
+            f"<td>{flags_cell}</td>"
             f"<td>{_esc(entry.rationale)}</td>"
             "</tr>"
         )
@@ -521,6 +637,20 @@ def render_advisor_html(sweep: AdvisorSweepReport) -> str:
   .badge-whole_step {{ background: #065f46; color: #6ee7b7; }}
   .badge-layer_group, .badge-single_layer {{ background: #78350f; color: #fde68a; }}
   .badge-per_op {{ background: #0c4a6e; color: #7dd3fc; }}
+  .prov-tag {{
+    display: inline-block; padding: 1px 6px; margin: 1px;
+    border-radius: 4px; font-size: 11px; font-weight: 600;
+  }}
+  .prov-tag-FACT {{ background: #1e3a8a; color: #bfdbfe; }}
+  .prov-tag-DERIVED {{ background: #065f46; color: #a7f3d0; }}
+  .prov-tag-ASSUMED {{ background: #78350f; color: #fde68a; }}
+  .prov-tag-MEASURED {{ background: #4c1d95; color: #ddd6fe; }}
+  .prov-details {{ margin-top: 6px; font-size: 12px; }}
+  .flag-pill {{
+    display: inline-block; padding: 2px 8px; margin: 1px;
+    border-radius: 999px; font-size: 11px; font-weight: 600;
+    background: #7f1d1d; color: #fecaca;
+  }}
 </style>
 </head>
 <body>
@@ -560,20 +690,25 @@ def render_advisor_html(sweep: AdvisorSweepReport) -> str:
     </div>
   </div>
   <div class="card" style="margin-bottom: 20px;">
-    <h2>3. How to Read the Scope and MoE Mode</h2>
+    <h2>3. Step Latency Floor vs Upper Uncertainty Band</h2>
+    {band_svg}
+  </div>
+  <div class="card" style="margin-bottom: 20px;">
+    <h2>4. How to Read the Scope and MoE Mode</h2>
     <p>Scope: where the kernel boundary falls.</p>
     <ul>{scope_items}</ul>
     <p>MoE mode: where tokens are grouped by expert and where the data lives.</p>
     <ul>{moe_items}</ul>
   </div>
   <div class="card" style="margin-bottom: 20px;">
-    <h2>4. Request Regime Recommendations</h2>
+    <h2>5. Request Regime Recommendations</h2>
     <table>
       <thead>
         <tr>
           <th>Request Regime</th><th>Layout</th><th>Active Tokens (T)</th>
           <th>AI (FLOP/B)</th><th>Token Passes</th><th>Scope</th><th>MoE Mode</th>
-          <th>Step Bound (us)</th><th>Mechanical Rationale</th>
+          <th>Step Bound (us)</th><th>Provenance</th><th>Flags</th>
+          <th>Mechanical Rationale</th>
         </tr>
       </thead>
       <tbody>
@@ -582,7 +717,7 @@ def render_advisor_html(sweep: AdvisorSweepReport) -> str:
     </table>
   </div>
   <div class="card">
-    <h2>5. How to Tailor to Your Request Mix</h2>
+    <h2>6. How to Tailor to Your Request Mix</h2>
     <ul>{rules_html}</ul>
   </div>
 </div>
