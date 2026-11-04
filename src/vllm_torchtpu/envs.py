@@ -204,6 +204,7 @@ if TYPE_CHECKING:
     VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS: int = 8
     VLLM_TPU_SRPT_ATTN_WORK_CAP: int = 0
     VLLM_TPU_SRPT_ATTN_TILE_TOKENS: int = 32
+    VLLM_TPU_XPROF_ANNOTATIONS: bool = True
 
 
 def env_with_choices(
@@ -1233,6 +1234,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # tile).
     "VLLM_TPU_SRPT_ATTN_TILE_TOKENS": env_nonnegative_int(
         "VLLM_TPU_SRPT_ATTN_TILE_TOKENS", 32
+    ),
+    # Emit hierarchical FX module name scopes, full Python call stacks, and
+    # deterministic XLA module names into compiled HLO / XProf traces.
+    "VLLM_TPU_XPROF_ANNOTATIONS": env_bool(
+        "VLLM_TPU_XPROF_ANNOTATIONS", default=True
     ),
 }
 

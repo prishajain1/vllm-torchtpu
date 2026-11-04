@@ -46,7 +46,7 @@ from vllm.config import VllmConfig
 from vllm.config.utils import Range
 
 from vllm_torchtpu import envs, utils
-from vllm_torchtpu.compilation import shape_variants
+from vllm_torchtpu.compilation import shape_variants, xprof_annotations
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -321,6 +321,8 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # K3 custom-op registration, sharding, and Attention Residual bridges.
     "vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
     "vllm_torchtpu/models/vllm/kimi_k3/layers.py",
+    # XProf MLIR debug-location & XLA module-name rewriter.
+    "vllm_torchtpu/compilation/xprof_annotations.py",
 )
 
 # vLLM-Omni diffusion code, dropped from the hashed set above. Diffusion
@@ -556,6 +558,7 @@ class TpuCompilerAdaptor(CompilerInterface):
         self,
         graph: fx.GraphModule,
         example_inputs: list[Any],
+        token_bucket: int | None = None,
     ) -> tuple[Callable[..., Any], Any | None]:
         """Compile `graph` with TpuBackend, and grab its serializable entry.
 
@@ -594,7 +597,11 @@ class TpuCompilerAdaptor(CompilerInterface):
         from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import config
 
         config.reset_scheduling_group_ids()
-        with torch._guards.tracing(tracing_ctx):
+        xprof_annotations.install_xprof_annotation_hooks()
+        with (
+            xprof_annotations.compilation_context(token_bucket=token_bucket),
+            torch._guards.tracing(tracing_ctx),
+        ):
             compiled_fn = _tpu_backend(graph, example_inputs)
 
         # Read `serialize` off the object TpuBackend returned, before any
@@ -869,7 +876,9 @@ class TpuCompilerAdaptor(CompilerInterface):
                 shape_variants.remember(self.cache_dir, key, graph, compiled_fn)
             return compiled_fn, handle
 
-        compiled_fn, entry = self._run_backend(graph, example_inputs)
+        compiled_fn, entry = self._run_backend(
+            graph, example_inputs, token_bucket=size
+        )
 
         if was_wrapped:
             # Undo _ensure_tuple_output on the result side, so callers see the
@@ -954,7 +963,9 @@ class TpuCompilerAdaptor(CompilerInterface):
             fingerprint = (
                 _graph_fingerprint(graph) if envs.TPU_PRECOMPILE_PEER_REPLAY else None
             )
-            compiled_fn, entry = self._run_backend(graph, example_inputs)
+            compiled_fn, entry = self._run_backend(
+                graph, example_inputs, token_bucket=size
+            )
             # Self-heal: overwrite the artifact vLLM will hand us again next
             # run. Without this a single stale entry recompiles forever.
             if (
