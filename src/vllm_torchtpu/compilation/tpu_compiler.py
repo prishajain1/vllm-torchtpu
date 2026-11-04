@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 """TPU compiler adaptor for vLLM's VLLM_COMPILE mode.
 
 This module implements the CompilerInterface for TPU, enabling
@@ -39,12 +38,16 @@ from typing import Any
 
 import torch
 import torch._guards
+import torch.distributed as dist
+import torch.distributed.distributed_c10d as c10d
 import torch.fx as fx
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch_tpu._internal.compile._backend import TpuBackend
+from torch_tpu._internal.distributed import tpu_distributed
 from vllm.compilation.compiler_interface import CompilerInterface
 from vllm.config import VllmConfig
 from vllm.config.utils import Range
+from vllm.distributed import parallel_state
 
 from vllm_torchtpu import envs, utils
 from vllm_torchtpu.compilation import shape_variants
@@ -93,8 +96,9 @@ _tpu_backend = TpuBackend()
 # than stalling startup for an hour.
 PEER_WAIT_S = 600.0
 _PEER_POLL_S = 0.5
-# get_attr tensors up to this size are hashed by value; bigger ones, which are
-# weights rather than constants, by dtype and shape.
+# Parameter tensors up to this size are hashed by value; bigger Parameters
+# (model weights) are hashed by dtype and shape, while non-Parameter constant
+# tensors are always hashed in full.
 _FINGERPRINT_MAX_NUMEL = 1 << 16
 
 _peer_wait = threading.local()
@@ -115,21 +119,373 @@ def wait_for_peer_artifact(timeout_s: float):
         _peer_wait.timeout_s = 0.0
 
 
+_GROUP_ARG_NAMES = frozenset({"group_name", "group"})
+_GROUP_SIZE_ARG_NAMES = frozenset({"group_size", "world_size"})
+
+_SYMMETRIC_COLLECTIVE_SCHEMAS = frozenset(
+    {
+        "_c10d_functional::all_reduce",
+        "_c10d_functional::all_reduce_",
+        "_c10d_functional::all_reduce_coalesced",
+        "_c10d_functional::all_reduce_coalesced_",
+        "_c10d_functional::all_gather_into_tensor",
+        "_c10d_functional::all_gather_into_tensor_out",
+        "_c10d_functional::all_gather_into_tensor_coalesced",
+        "_c10d_functional::reduce_scatter_tensor",
+        "_c10d_functional::reduce_scatter_tensor_out",
+        "_c10d_functional::reduce_scatter_tensor_coalesced",
+        "_c10d_functional::all_to_all_single",
+        "_c10d_functional_autograd::all_gather_into_tensor",
+        "_c10d_functional_autograd::reduce_scatter_tensor",
+        "_c10d_functional_autograd::all_to_all_single",
+        "tpu::_all_gather_dim",
+        "tpu::_reduce_scatter_dim",
+        "vllm::all_reduce",
+        "vllm::all_gather",
+        "vllm::reduce_scatter",
+        "vllm::patched_fused_scaled_matmul_reduce_scatter",
+    }
+)
+
+
+def _supports_global_subgroup_tiling() -> bool:
+    """True if TorchTPU tiles subgroup collectives across all world devices.
+
+    TorchTPU >= 0.2.0 (commit 2e0c3677a) exposes `global_device_attributes` on
+    `tpu_distributed` and tiles every subgroup collective's `replica_groups`
+    across all `world_size` partitions via `GatherAllSubgroups`. Older releases
+    (e.g. TorchTPU 0.1.1 before `3b08b43fd`) bind pure subgroup graphs to the
+    subgroup's local device IDs unless a world-sized op is present in the graph.
+    """
+    return hasattr(tpu_distributed, "global_device_attributes")
+
+
+def _distributed_world_size() -> int | None:
+    if dist.is_initialized():
+        return int(dist.get_world_size())
+    return None
+
+
+def _distributed_rank() -> int | None:
+    if dist.is_initialized():
+        return int(dist.get_rank())
+    return None
+
+
+def _find_vllm_group(group_name: str) -> Any | None:
+    """Find a registered vLLM `GroupCoordinator` by `unique_name` or `device_group`."""
+    group_ref = parallel_state._groups.get(group_name)
+    if group_ref is not None:
+        group = group_ref()
+        if group is not None:
+            return group
+    for group_ref in parallel_state._groups.values():
+        group = group_ref()
+        if (
+            group is not None
+            and group.device_group is not None
+            and group.device_group.group_name == group_name
+        ):
+            return group
+    return None
+
+
+def _resolve_group_metadata(
+    group_name: str,
+) -> tuple[
+    str | None,
+    str | None,
+    int | None,
+    tuple[int, ...] | None,
+    tuple[tuple[int, ...], ...] | None,
+]:
+    """Return `(kind, role, size, ranks, group_ranks)` for `group_name`."""
+    group = _find_vllm_group(group_name)
+    if group is not None:
+        role = group.unique_name.partition(":")[0]
+        ranks = tuple(int(r) for r in group.ranks)
+        group_ranks = (
+            tuple(tuple(int(r) for r in sg) for sg in group.group_ranks)
+            if group.group_ranks
+            else None
+        )
+        return ("vllm_pg", role, int(group.world_size), ranks, group_ranks)
+
+    try:
+        pg = c10d._resolve_process_group(c10d.GroupName(group_name))
+        ranks = tuple(int(r) for r in c10d.get_process_group_ranks(pg))
+    except (KeyError, ValueError, RuntimeError):
+        return (None, None, None, None, None)
+    if ranks:
+        return ("c10d_pg", None, len(ranks), ranks, None)
+    return (None, None, None, None, None)
+
+
+def _canonicalize_process_group_name(
+    group_name: str,
+    ordinal: int,
+    *,
+    global_tiling: bool = True,
+) -> str:
+    """Map a rank-local process-group handle to a canonical token.
+
+    When `global_tiling` is True (TorchTPU >= 0.2.0 with `GatherAllSubgroups`,
+    or any graph containing a world-sized op that forces an all-device
+    `DeviceAssignment`), ranks in different subgroups compile identical
+    all-device SPMD executables. When a vLLM `GroupCoordinator` is registered
+    for `group_name` (either by `unique_name` or `device_group.group_name`),
+    its full `group_ranks` partition is encoded directly so wrap-around subgroup
+    layouts (such as `tpu7x` topology-aware PCP/TP meshes) match across all
+    subgroups. Raw `c10d` groups fall back to subgroup size and rank-stride
+    geometry.
+
+    When `global_tiling` is False (legacy TorchTPU < 0.2.0 compiling a pure
+    subgroup graph with no world-sized op), the compiled executable's
+    `DeviceAssignment` is bound to that subgroup's physical devices, so the
+    token preserves the subgroup's rank membership (`ranks=...`). Ranks within
+    the same subgroup still share the same token and replay from their subgroup
+    leader, while ranks in different subgroups get distinct tokens.
+    """
+    kind, role, size, ranks, group_ranks = _resolve_group_metadata(group_name)
+    strides = (
+        tuple(ranks[i + 1] - ranks[i] for i in range(len(ranks) - 1))
+        if ranks is not None and len(ranks) > 1
+        else ()
+    )
+    if kind == "vllm_pg" and size is not None:
+        if global_tiling:
+            if group_ranks is not None:
+                return f"vllm_pg:{ordinal}:{role}:size={size}:group_ranks={group_ranks}"
+            return f"vllm_pg:{ordinal}:{role}:size={size}:strides={strides}"
+        if ranks is not None:
+            return f"vllm_pg:{ordinal}:{role}:size={size}:ranks={ranks}"
+        return f"vllm_pg:{ordinal}:{group_name}:size={size}"
+
+    if kind == "c10d_pg" and size is not None and ranks is not None:
+        if global_tiling:
+            return f"c10d_pg:{ordinal}:size={size}:strides={strides}"
+        return f"c10d_pg:{ordinal}:size={size}:ranks={ranks}"
+
+    raise ValueError(f"Cannot resolve process group {group_name!r}")
+
+
+def _node_schema(target: Any) -> Any | None:
+    if isinstance(target, torch._ops.OpOverload):
+        return target._schema
+    if (
+        isinstance(target, torch._ops.OpOverloadPacket)
+        and "default" in target.overloads()
+    ):
+        return target.default._schema
+    return None
+
+
+def _device_assignment_size(value: Any) -> int:
+    if not isinstance(value, (list, tuple)):
+        return 0
+    total = 0
+    for item in value:
+        if isinstance(item, (list, tuple)):
+            total += len(item)
+        elif isinstance(item, int):
+            total += 1
+    return total
+
+
+def _iter_node_group_names(node: fx.Node, schema: Any | None) -> list[str]:
+    names: list[str] = []
+    if schema is not None:
+        for idx, arg_spec in enumerate(schema.arguments):
+            if arg_spec.name not in _GROUP_ARG_NAMES:
+                continue
+            if idx < len(node.args):
+                arg = node.args[idx]
+                if isinstance(arg, str):
+                    names.append(arg)
+    for key in _GROUP_ARG_NAMES:
+        val = node.kwargs.get(key)
+        if isinstance(val, str):
+            names.append(val)
+    return names
+
+
+def _graph_has_world_sized_op(module: fx.GraphModule, world_size: int) -> bool:
+    """True if `module` contains an op spanning all `world_size` devices."""
+    for submod in module.modules():
+        if not isinstance(submod, fx.GraphModule):
+            continue
+        for node in submod.graph.nodes:
+            if node.op != "call_function":
+                continue
+            schema = _node_schema(node.target)
+            for group_name in _iter_node_group_names(node, schema):
+                _kind, _role, size, _ranks, _group_ranks = _resolve_group_metadata(
+                    group_name
+                )
+                if size is not None and size >= world_size:
+                    return True
+            if schema is not None:
+                for idx, arg_spec in enumerate(schema.arguments):
+                    if idx >= len(node.args):
+                        continue
+                    arg_val = node.args[idx]
+                    if (
+                        arg_spec.name in _GROUP_SIZE_ARG_NAMES
+                        and isinstance(arg_val, int)
+                        and arg_val >= world_size
+                    ):
+                        return True
+                    if (
+                        arg_spec.name == "device_assignment"
+                        and _device_assignment_size(arg_val) >= world_size
+                    ):
+                        return True
+            for key in _GROUP_SIZE_ARG_NAMES:
+                val = node.kwargs.get(key)
+                if isinstance(val, int) and val >= world_size:
+                    return True
+            if (
+                _device_assignment_size(node.kwargs.get("device_assignment"))
+                >= world_size
+            ):
+                return True
+    return False
+
+
+def _uses_global_subgroup_tiling(module: fx.GraphModule) -> bool:
+    world_size = _distributed_world_size()
+    if world_size is None or world_size <= 1:
+        return True
+    if _supports_global_subgroup_tiling():
+        return True
+    return _graph_has_world_sized_op(module, world_size)
+
+
+def _has_subgroup_follower_role(graph: fx.GraphModule) -> bool:
+    """True when `graph` is subgroup-bound and this rank is not its subgroup leader."""
+    if _uses_global_subgroup_tiling(graph):
+        return False
+    current_rank = _distributed_rank()
+    if current_rank is None:
+        return False
+    for submod in graph.modules():
+        if not isinstance(submod, fx.GraphModule):
+            continue
+        for node in submod.graph.nodes:
+            if node.op != "call_function":
+                continue
+            schema = _node_schema(node.target)
+            for group_name in _iter_node_group_names(node, schema):
+                _kind, _role, _size, ranks, _group_ranks = _resolve_group_metadata(
+                    group_name
+                )
+                if (
+                    ranks
+                    and len(ranks) > 1
+                    and current_rank in ranks
+                    and current_rank != ranks[0]
+                ):
+                    return True
+    return False
+
+
+def _normalized_module_code(
+    module: fx.GraphModule,
+    canonical_by_raw: dict[str, str] | None = None,
+    *,
+    global_tiling: bool | None = None,
+) -> str:
+    """Return `module.code` with symmetric collective `group_name`s canonicalized.
+
+    Only symmetric subgroup collectives in `_SYMMETRIC_COLLECTIVE_SCHEMAS` are
+    canonicalized; rooted or point-to-point ops with a `group_name`/`group`
+    string argument raise `ValueError` so `_graph_fingerprint` returns `None`.
+    """
+    if global_tiling is None:
+        global_tiling = _uses_global_subgroup_tiling(module)
+    saved: list[tuple[fx.Node, tuple[Any, ...], dict[str, Any]]] = []
+    if canonical_by_raw is None:
+        canonical_by_raw = {}
+
+    def _canonical(raw: str) -> str:
+        token = canonical_by_raw.get(raw)
+        if token is None:
+            token = _canonicalize_process_group_name(
+                raw, len(canonical_by_raw), global_tiling=global_tiling
+            )
+            canonical_by_raw[raw] = token
+        return token
+
+    try:
+        for node in module.graph.nodes:
+            if node.op != "call_function":
+                continue
+            schema = _node_schema(node.target)
+            if schema is None:
+                continue
+            new_args: list[Any] | None = None
+            new_kwargs: dict[str, Any] | None = None
+
+            for idx, arg_spec in enumerate(schema.arguments):
+                if arg_spec.name not in _GROUP_ARG_NAMES:
+                    continue
+                has_pos_str = idx < len(node.args) and isinstance(node.args[idx], str)
+                val = node.kwargs.get(arg_spec.name)
+                has_kw_str = isinstance(val, str)
+                if not has_pos_str and not has_kw_str:
+                    continue
+                if schema.name not in _SYMMETRIC_COLLECTIVE_SCHEMAS:
+                    raise ValueError(
+                        f"Cannot canonicalize non-symmetric collective {schema.name!r}"
+                    )
+                if has_pos_str:
+                    if new_args is None:
+                        new_args = list(node.args)
+                    new_args[idx] = _canonical(node.args[idx])
+                if has_kw_str:
+                    if new_kwargs is None:
+                        new_kwargs = dict(node.kwargs)
+                    new_kwargs[arg_spec.name] = _canonical(val)
+
+            if new_args is not None or new_kwargs is not None:
+                saved.append((node, node.args, node.kwargs))
+                if new_args is not None:
+                    node.args = tuple(new_args)
+                if new_kwargs is not None:
+                    node.kwargs = new_kwargs
+
+        if not saved:
+            return module.code
+        return module.graph.python_code(root_module="self").src
+    finally:
+        for node, orig_args, orig_kwargs in saved:
+            node.args = orig_args
+            node.kwargs = orig_kwargs
+
+
 def _graph_fingerprint(graph: fx.GraphModule) -> str | None:
     """Hash of the code of `graph` and its submodules and of their constants.
 
     Two ranks with the same fingerprint traced the same program, so either can
     replay the other's artifact. A rank-dependent value baked into the graph,
     e.g. a Python int from `rank_in_group`, changes the code and so the hash.
-    None if the graph cannot be hashed; its artifact is then only replayed by
-    the rank that saved it.
+    Rank-local `c10d` `group_name` identifiers on symmetric subgroup collectives
+    are canonicalized via `_normalized_module_code`. None if the graph cannot
+    be hashed (including when a group cannot be resolved or a non-symmetric
+    collective is present); its artifact is then only replayed by the rank that
+    saved it.
     """
     try:
         h = hashlib.sha256()
+        global_tiling = _uses_global_subgroup_tiling(graph)
+        canonical_by_raw: dict[str, str] = {}
         for name, module in graph.named_modules():
             if not isinstance(module, fx.GraphModule):
                 continue
-            h.update(f"{name}\n{module.code}".encode())
+            norm_code = _normalized_module_code(
+                module, canonical_by_raw, global_tiling=global_tiling
+            )
+            h.update(f"{name}\n{norm_code}".encode())
             for node in module.graph.nodes:
                 if node.op != "get_attr":
                     continue
@@ -141,7 +497,10 @@ def _graph_fingerprint(graph: fx.GraphModule) -> str | None:
                     h.update(type(value).__qualname__.encode())
                     continue
                 h.update(f"{value.dtype}{tuple(value.shape)}".encode())
-                if value.numel() <= _FINGERPRINT_MAX_NUMEL:
+                if (
+                    not isinstance(value, torch.nn.Parameter)
+                    or value.numel() <= _FINGERPRINT_MAX_NUMEL
+                ):
                     flat = value.detach().to("cpu").contiguous().reshape(-1)
                     h.update(flat.view(torch.uint8).numpy().tobytes())
         return h.hexdigest()
@@ -166,11 +525,20 @@ def _deserialize_entry(entry: Any) -> Callable[..., Any]:
         deserialize_bundled_cache_entry,
     )
 
-    # Upstream PR #2068: Torch deep-copies the entry for reserialization,
-    # which vLLM never uses. CompiledArtifact.__reduce__ reloads the executable.
+    # `deserialize_bundled_cache_entry` deep-copies `entry` so the runnable can
+    # be serialized again. `CompiledArtifact` has no `__deepcopy__`, so the copy
+    # goes through `__reduce__` and loads a second PJRT executable per graph.
+    # vllm-torchtpu never re-serializes a replayed runnable, so return `entry`
+    # itself from `__deepcopy__` and reuse the loaded executable. Remove the
+    # temporary override in `finally:` so we do not leave an unpicklable lambda
+    # attribute on the caller's `entry` object.
     with contextlib.suppress(AttributeError, TypeError):
         entry.__deepcopy__ = lambda _memo: entry
-    return deserialize_bundled_cache_entry(entry)
+    try:
+        return deserialize_bundled_cache_entry(entry)
+    finally:
+        with contextlib.suppress(AttributeError, TypeError):
+            entry.__dict__.pop("__deepcopy__", None)
 
 
 _TPU_COMPILE_ENV_IGNORED = {
@@ -706,20 +1074,28 @@ class TpuCompilerAdaptor(CompilerInterface):
     ) -> tuple[Callable[..., Any], str] | None:
         """Replay the artifact another rank saved for this bucket.
 
-        Waits for one to appear inside `wait_for_peer_artifact`. Returns the
-        runnable and the peer's path, or None to compile: nothing appeared in
-        time, or what appeared was built from a different graph -- then the
-        ranks do not trace the same program and waiting on would not help.
+        Waits for one to appear inside `wait_for_peer_artifact`. Scans all
+        available peer artifacts for one whose fingerprint matches `graph`, so
+        subgroup-bound executables (where each TP subgroup compiles its own
+        device assignment) match the peer from the same subgroup rather than
+        stopping at `paths[0]`.
         """
         deadline = time.monotonic() + getattr(_peer_wait, "timeout_s", 0.0)
-        paths = self._peer_paths(key)
-        while not paths and time.monotonic() < deadline:
+        keep_waiting_on_mismatch = _has_subgroup_follower_role(graph)
+        tried: set[str] = set()
+        while True:
+            for path in self._peer_paths(key):
+                if path in tried:
+                    continue
+                tried.add(path)
+                compiled_fn = self._replay(path, graph, was_wrapped, fingerprint)
+                if compiled_fn is not None:
+                    return compiled_fn, path
+            if tried and not keep_waiting_on_mismatch:
+                return None
+            if time.monotonic() >= deadline:
+                return None
             time.sleep(_PEER_POLL_S)
-            paths = self._peer_paths(key)
-        if not paths:
-            return None
-        compiled_fn = self._replay(paths[0], graph, was_wrapped, fingerprint)
-        return None if compiled_fn is None else (compiled_fn, paths[0])
 
     @staticmethod
     def _link_artifact(src: str, dst: str) -> bool:
@@ -844,6 +1220,7 @@ class TpuCompilerAdaptor(CompilerInterface):
         # recompile path in `load`, not this one.
         handle = None
         if caching and entry is not None:
+            assert self.cache_dir is not None
             save_path = os.path.join(self.cache_dir, key)
             if self._save_handle(
                 key, save_path, entry, graph, was_wrapped, fingerprint

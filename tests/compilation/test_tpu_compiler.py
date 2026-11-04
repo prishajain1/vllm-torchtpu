@@ -14,12 +14,26 @@
 
 import importlib
 import os
+import threading
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+import torch
+import torch.distributed._functional_collectives
+import torch.distributed.distributed_c10d as c10d
+import torch.fx as fx
+from vllm.distributed import parallel_state
 
+from vllm_torchtpu.compilation import tpu_compiler as tpu_compiler_mod
+from vllm_torchtpu.compilation.tpu_compiler import (
+    _canonicalize_process_group_name,
+    _graph_fingerprint,
+    _normalized_module_code,
+    wait_for_peer_artifact,
+)
 from vllm_torchtpu.env_override import _TPU_VMEM_BYTES_PER_TENSOR_CORE
 
 
@@ -711,20 +725,580 @@ class TestTpuCompilerCache:
         with open(path, "rb") as f:
             assert pickle.load(f).fingerprint is None
 
+    @staticmethod
+    def _trace_all_reduce_graph(
+        group_name: str, reduce_op: str = "sum"
+    ) -> fx.GraphModule:
+        def forward(x: torch.Tensor) -> torch.Tensor:
+            reduced = torch.ops._c10d_functional.all_reduce(x, reduce_op, group_name)
+            waited = torch.ops._c10d_functional.wait_tensor(reduced)
+            return waited + 1.0
+
+        return fx.symbolic_trace(forward)
+
+    @staticmethod
+    def _trace_multi_collective_graph(
+        tp_group: str,
+        ep_group: str,
+        reduce_op: str = "sum",
+        group_size: int = 2,
+    ) -> fx.GraphModule:
+        def forward(x: torch.Tensor) -> torch.Tensor:
+            scattered = torch.ops._c10d_functional.reduce_scatter_tensor(
+                x, reduce_op, group_size, tp_group
+            )
+            scattered_wait = torch.ops._c10d_functional.wait_tensor(scattered)
+            routed = torch.ops._c10d_functional.all_to_all_single(
+                scattered_wait, [2, 2], [2, 2], ep_group
+            )
+            routed_wait = torch.ops._c10d_functional.wait_tensor(routed)
+            gathered = torch.ops._c10d_functional.all_gather_into_tensor(
+                routed_wait, group_size, tp_group
+            )
+            gathered_wait = torch.ops._c10d_functional.wait_tensor(gathered)
+            reduced = torch.ops._c10d_functional.all_reduce(
+                gathered_wait, reduce_op, tp_group
+            )
+            return torch.ops._c10d_functional.wait_tensor(reduced)
+
+        return fx.symbolic_trace(forward)
+
+    @staticmethod
+    def _install_group_stand_ins(monkeypatch):
+        class _FakeDeviceGroup:
+            def __init__(self, group_name: str) -> None:
+                self.group_name = group_name
+
+        class _FakeGroup:
+            def __init__(
+                self,
+                unique_name: str,
+                ranks: list[int],
+                group_ranks: list[list[int]],
+                device_group_name: str | None = None,
+            ) -> None:
+                self.unique_name = unique_name
+                self.ranks = ranks
+                self.world_size = len(ranks)
+                self.group_ranks = group_ranks
+                self.device_group = (
+                    _FakeDeviceGroup(device_group_name)
+                    if device_group_name is not None
+                    else None
+                )
+
+        tp_2_groups = [[0, 1], [2, 3], [4, 5], [6, 7]]
+        tp_strided_groups = [[0, 4], [1, 5], [2, 6], [3, 7]]
+        dp_2_groups = [[0, 2], [1, 3], [4, 6], [5, 7]]
+        ep_8_groups = [[0, 1, 2, 3, 4, 5, 6, 7]]
+        tp_wrap_groups = [[0, 1, 6, 7], [4, 5, 2, 3]]
+
+        live_groups = [
+            _FakeGroup(unique_name="tp:0", ranks=[0, 1], group_ranks=tp_2_groups),
+            _FakeGroup(unique_name="tp:3", ranks=[6, 7], group_ranks=tp_2_groups),
+            _FakeGroup(unique_name="tp:4", ranks=[0, 4], group_ranks=tp_strided_groups),
+            _FakeGroup(unique_name="dp:0", ranks=[0, 2], group_ranks=dp_2_groups),
+            _FakeGroup(unique_name="dp:3", ranks=[5, 7], group_ranks=dp_2_groups),
+            _FakeGroup(unique_name="pcp:0", ranks=[0, 1], group_ranks=tp_2_groups),
+            _FakeGroup(unique_name="pcp:3", ranks=[6, 7], group_ranks=tp_2_groups),
+            _FakeGroup(unique_name="dcp:0", ranks=[0, 1], group_ranks=tp_2_groups),
+            _FakeGroup(unique_name="dcp:3", ranks=[6, 7], group_ranks=tp_2_groups),
+            _FakeGroup(
+                unique_name="ep:0",
+                ranks=[0, 1, 2, 3, 4, 5, 6, 7],
+                group_ranks=ep_8_groups,
+            ),
+            _FakeGroup(
+                unique_name="ep:3",
+                ranks=[0, 1, 2, 3, 4, 5, 6, 7],
+                group_ranks=ep_8_groups,
+            ),
+            _FakeGroup(
+                unique_name="tp_wrap:0",
+                ranks=[0, 1, 6, 7],
+                group_ranks=tp_wrap_groups,
+                device_group_name="tp_wrap_c10d_0",
+            ),
+            _FakeGroup(
+                unique_name="tp_wrap:1",
+                ranks=[4, 5, 2, 3],
+                group_ranks=tp_wrap_groups,
+                device_group_name="tp_wrap_c10d_1",
+            ),
+            _FakeGroup(
+                unique_name="pcp_wrap:0",
+                ranks=[0, 4],
+                group_ranks=tp_strided_groups,
+                device_group_name="pcp_wrap_c10d_0",
+            ),
+        ]
+        monkeypatch.setattr(
+            parallel_state,
+            "_groups",
+            {group.unique_name: weakref.ref(group) for group in live_groups},
+        )
+
+        pg_ranks = {
+            "1": [0, 1],
+            "3": [2, 3],
+            "5": [4, 5],
+            "7": [6, 7],
+            "13": [0, 2, 4, 6],
+            "15": [1, 3, 5, 7],
+            "99": [0, 4],
+            "ep": [0, 1, 2, 3, 4, 5, 6, 7],
+        }
+
+        def _resolve_pg(name):
+            key = str(name)
+            if key not in pg_ranks:
+                raise KeyError(key)
+            return key
+
+        monkeypatch.setattr(c10d, "_resolve_process_group", _resolve_pg)
+        monkeypatch.setattr(
+            c10d, "get_process_group_ranks", lambda pg: pg_ranks[str(pg)]
+        )
+        return live_groups
+
+    def test_a_peer_artifact_is_replayed_across_c10d_subgroups(
+        self, tmp_path, monkeypatch
+    ):
+        """Ranks in distinct DP/TP subgroups trace different rank-local c10d
+        group_name strings for the same collective role, yet replay the first
+        rank's compiled artifact."""
+        _keep_alive = self._install_group_stand_ins(monkeypatch)
+        (a, b), compile, compiled, replayed = self._peer_compilers(
+            tmp_path, monkeypatch
+        )
+        compile(a, self._trace_all_reduce_graph("1"))
+        fn, handle = compile(b, self._trace_all_reduce_graph("7"))
+
+        assert compiled == [0]
+        assert replayed == ["entry-from-rank-0"]
+        assert fn() == "entry-from-rank-0"
+        key, path, _ = handle
+        assert a.cache_dir is not None
+        assert os.path.samefile(path, os.path.join(a.cache_dir, key))
+
+    def test_fingerprint_canonicalizes_c10d_subgroup_names_and_preserves_graph(
+        self, monkeypatch
+    ):
+        """Multi-group and role-indexed graphs match across subgroups without
+        mutating the GraphModule's code or node arguments."""
+        _keep_alive = self._install_group_stand_ins(monkeypatch)
+        gm_rank0 = self._trace_multi_collective_graph(tp_group="1", ep_group="13")
+        gm_rank7 = self._trace_multi_collective_graph(tp_group="7", ep_group="15")
+
+        code_before = gm_rank0.code
+        args_before = [(node.args, dict(node.kwargs)) for node in gm_rank0.graph.nodes]
+
+        fp_rank0 = _graph_fingerprint(gm_rank0)
+        fp_rank7 = _graph_fingerprint(gm_rank7)
+
+        assert fp_rank0 is not None
+        assert fp_rank0 == fp_rank7
+        assert gm_rank0.code == code_before
+        assert [
+            (node.args, dict(node.kwargs)) for node in gm_rank0.graph.nodes
+        ] == args_before
+
+        for role in ("tp", "dp", "pcp", "dcp", "ep"):
+            assert _graph_fingerprint(
+                self._trace_all_reduce_graph(f"{role}:0")
+            ) == _graph_fingerprint(self._trace_all_reduce_graph(f"{role}:3"))
+
+    def test_fingerprint_with_vllm_parallel_state_and_c10d_stand_ins(self, monkeypatch):
+        """Resolved vLLM GroupCoordinators and c10d ProcessGroups encode
+        partition or stride geometry and differ when role, size, or layout
+        differ."""
+        _keep_alive = self._install_group_stand_ins(monkeypatch)
+
+        assert (
+            _canonicalize_process_group_name("tp:0", 0)
+            == "vllm_pg:0:tp:size=2:group_ranks=((0, 1), (2, 3), (4, 5), (6, 7))"
+        )
+        assert (
+            _canonicalize_process_group_name("tp:4", 0)
+            == "vllm_pg:0:tp:size=2:group_ranks=((0, 4), (1, 5), (2, 6), (3, 7))"
+        )
+        assert (
+            _canonicalize_process_group_name("1", 0) == "c10d_pg:0:size=2:strides=(1,)"
+        )
+        assert _graph_fingerprint(
+            self._trace_all_reduce_graph("tp:0")
+        ) != _graph_fingerprint(self._trace_all_reduce_graph("tp:4"))
+        assert _graph_fingerprint(
+            self._trace_all_reduce_graph("tp:0")
+        ) != _graph_fingerprint(self._trace_all_reduce_graph("ep:0"))
+
+        assert _graph_fingerprint(
+            self._trace_all_reduce_graph("1")
+        ) != _graph_fingerprint(self._trace_all_reduce_graph("13"))
+        assert _graph_fingerprint(
+            self._trace_all_reduce_graph("1")
+        ) != _graph_fingerprint(self._trace_all_reduce_graph("99"))
+
+    def test_fingerprint_matches_across_wrap_around_tpu7x_subgroups(self, monkeypatch):
+        """Wrap-around tpu7x subgroups (e.g. tp=(0,1,6,7) and tp=(4,5,2,3))
+        share the same GroupCoordinator.group_ranks partition and match whether
+        referenced by unique_name or device_group.group_name."""
+        _keep_alive = self._install_group_stand_ins(monkeypatch)
+
+        assert _graph_fingerprint(
+            self._trace_all_reduce_graph("tp_wrap:0")
+        ) == _graph_fingerprint(self._trace_all_reduce_graph("tp_wrap:1"))
+        assert _graph_fingerprint(
+            self._trace_all_reduce_graph("tp_wrap_c10d_0")
+        ) == _graph_fingerprint(self._trace_all_reduce_graph("tp_wrap_c10d_1"))
+        assert _graph_fingerprint(
+            self._trace_all_reduce_graph("tp_wrap_c10d_0")
+        ) != _graph_fingerprint(self._trace_all_reduce_graph("pcp_wrap_c10d_0"))
+
+    def test_fingerprint_canonicalizes_keyword_group_name_and_packet_without_default(
+        self, monkeypatch
+    ):
+        """Keyword group_name arguments are canonicalized without mutating
+        kwargs, and OpOverloadPackets lacking a 'default' overload (such as
+        torch.ops.aten.add_) do not cause _node_schema to fail."""
+        _keep_alive = self._install_group_stand_ins(monkeypatch)
+        assert "default" not in torch.ops.aten.add_.overloads()
+
+        def _build_kwarg_graph(group_name: str) -> fx.GraphModule:
+            graph = fx.Graph()
+            x = graph.placeholder("x")
+            added = graph.call_function(torch.ops.aten.add_, (x, x))
+            reduced = graph.call_function(
+                torch.ops._c10d_functional.all_reduce.default,
+                (added,),
+                {"reduce_op": "sum", "group_name": group_name},
+            )
+            waited = graph.call_function(
+                torch.ops._c10d_functional.wait_tensor.default, (reduced,)
+            )
+            graph.output(waited)
+            return fx.GraphModule(torch.nn.Module(), graph)
+
+        gm_rank0 = _build_kwarg_graph("1")
+        gm_rank7 = _build_kwarg_graph("7")
+        gm_rank_other = _build_kwarg_graph("13")
+        kwargs_before = [dict(node.kwargs) for node in gm_rank0.graph.nodes]
+
+        fp_rank0 = _graph_fingerprint(gm_rank0)
+        assert fp_rank0 is not None
+        assert fp_rank0 == _graph_fingerprint(gm_rank7)
+        assert fp_rank0 != _graph_fingerprint(gm_rank_other)
+        assert [dict(node.kwargs) for node in gm_rank0.graph.nodes] == kwargs_before
+
+    def test_fingerprint_shares_group_ordinals_across_submodules(self, monkeypatch):
+        """Group ordinals are shared across graph.named_modules() so submodules
+        using distinct same-geometry groups do not reset to ordinal 0."""
+        _keep_alive = self._install_group_stand_ins(monkeypatch)
+
+        def _build_two_submodule_graph(group_a: str, group_b: str) -> fx.GraphModule:
+            root = torch.nn.Module()
+            root.sub_a = self._trace_all_reduce_graph(group_a)
+            root.sub_b = self._trace_all_reduce_graph(group_b)
+            graph = fx.Graph()
+            x = graph.placeholder("x")
+            y = graph.call_module("sub_a", (x,))
+            z = graph.call_module("sub_b", (y,))
+            graph.output(z)
+            return fx.GraphModule(root, graph)
+
+        fp_same_0 = _graph_fingerprint(_build_two_submodule_graph("1", "1"))
+        fp_same_7 = _graph_fingerprint(_build_two_submodule_graph("7", "7"))
+        fp_distinct_07 = _graph_fingerprint(_build_two_submodule_graph("1", "7"))
+        fp_distinct_70 = _graph_fingerprint(_build_two_submodule_graph("7", "1"))
+
+        assert fp_same_0 is not None
+        assert fp_same_0 == fp_same_7
+        assert fp_distinct_07 == fp_distinct_70
+        assert fp_same_0 != fp_distinct_07
+
+    def test_non_symmetric_collective_returns_none_fingerprint(self, monkeypatch):
+        """Rooted or point-to-point collectives (such as broadcast) raise
+        ValueError in _normalized_module_code so _graph_fingerprint returns
+        None instead of aliasing across subgroups."""
+        _keep_alive = self._install_group_stand_ins(monkeypatch)
+
+        def _broadcast_forward(x: torch.Tensor) -> torch.Tensor:
+            out = torch.ops._c10d_functional.broadcast(x, 0, "1")
+            return torch.ops._c10d_functional.wait_tensor(out)
+
+        gm = fx.symbolic_trace(_broadcast_forward)
+        with pytest.raises(
+            ValueError,
+            match=(
+                "Cannot canonicalize non-symmetric collective "
+                "'_c10d_functional::broadcast'"
+            ),
+        ):
+            _normalized_module_code(gm)
+        assert _graph_fingerprint(gm) is None
+
+    def test_unresolved_group_returns_none_fingerprint(self, monkeypatch):
+        """An unresolvable group_name raises ValueError in
+        _canonicalize_process_group_name and causes _graph_fingerprint to return
+        None."""
+        _keep_alive = self._install_group_stand_ins(monkeypatch)
+
+        with pytest.raises(
+            ValueError,
+            match="Cannot resolve process group 'unknown_pg'",
+        ):
+            _canonicalize_process_group_name("unknown_pg", 0)
+
+        assert _graph_fingerprint(self._trace_all_reduce_graph("unknown_pg")) is None
+
+    def test_fingerprint_negative_collision_checks(self, monkeypatch):
+        """Semantically different graphs must never collide after canonicalization."""
+        _keep_alive = self._install_group_stand_ins(monkeypatch)
+        fp_sum = _graph_fingerprint(self._trace_all_reduce_graph("1", reduce_op="sum"))
+        fp_avg = _graph_fingerprint(self._trace_all_reduce_graph("1", reduce_op="avg"))
+        assert fp_sum != fp_avg
+
+        def _reduce_scatter_only(x: torch.Tensor) -> torch.Tensor:
+            out = torch.ops._c10d_functional.reduce_scatter_tensor(x, "sum", 2, "1")
+            return torch.ops._c10d_functional.wait_tensor(out)
+
+        assert fp_sum != _graph_fingerprint(fx.symbolic_trace(_reduce_scatter_only))
+
+        assert _graph_fingerprint(
+            self._trace_multi_collective_graph("1", "13", group_size=2)
+        ) != _graph_fingerprint(
+            self._trace_multi_collective_graph("1", "13", group_size=4)
+        )
+
+        assert _graph_fingerprint(
+            self._trace_multi_collective_graph(tp_group="1", ep_group="1")
+        ) != _graph_fingerprint(
+            self._trace_multi_collective_graph(tp_group="1", ep_group="13")
+        )
+
+        assert _graph_fingerprint(
+            self._trace_all_reduce_graph("tp:0")
+        ) != _graph_fingerprint(self._trace_all_reduce_graph("dp:0"))
+
+    def test_legacy_torchtpu_pure_subgroup_vs_world_tiled_fingerprint(
+        self, monkeypatch
+    ):
+        """Legacy TorchTPU (< 0.2.0) scopes pure subgroup graphs to each
+        subgroup while canonicalizing graphs that contain a world-sized op
+        across all subgroups."""
+        _keep_alive = self._install_group_stand_ins(monkeypatch)
+        monkeypatch.setattr(tpu_compiler_mod, "_distributed_world_size", lambda: 8)
+        monkeypatch.setattr(
+            tpu_compiler_mod, "_supports_global_subgroup_tiling", lambda: False
+        )
+
+        fp_r0 = _graph_fingerprint(self._trace_all_reduce_graph("1"))
+        fp_r1 = _graph_fingerprint(self._trace_all_reduce_graph("1"))
+        fp_r2 = _graph_fingerprint(self._trace_all_reduce_graph("3"))
+        fp_r3 = _graph_fingerprint(self._trace_all_reduce_graph("3"))
+        fp_r4 = _graph_fingerprint(self._trace_all_reduce_graph("5"))
+        fp_r6 = _graph_fingerprint(self._trace_all_reduce_graph("7"))
+
+        assert fp_r0 is not None
+        assert fp_r0 == fp_r1
+        assert fp_r2 == fp_r3
+        assert len({fp_r0, fp_r2, fp_r4, fp_r6}) == 4
+
+        fp_world_g0 = _graph_fingerprint(
+            self._trace_multi_collective_graph(tp_group="1", ep_group="ep")
+        )
+        fp_world_g1 = _graph_fingerprint(
+            self._trace_multi_collective_graph(tp_group="3", ep_group="ep")
+        )
+        fp_world_g3 = _graph_fingerprint(
+            self._trace_multi_collective_graph(tp_group="7", ep_group="ep")
+        )
+        assert fp_world_g0 is not None
+        assert fp_world_g0 == fp_world_g1 == fp_world_g3
+
+        @torch.library.custom_op("test_fix_b::world_pallas_op", mutates_args=())
+        def _world_pallas_op(
+            x: torch.Tensor, device_assignment: list[int]
+        ) -> torch.Tensor:
+            return x.clone()
+
+        @_world_pallas_op.register_fake
+        def _(x: torch.Tensor, device_assignment: list[int]) -> torch.Tensor:
+            return torch.empty_like(x)
+
+        def _trace_with_world_pallas(tp_group: str) -> fx.GraphModule:
+            def forward(x: torch.Tensor) -> torch.Tensor:
+                y = torch.ops._c10d_functional.all_reduce(x, "sum", tp_group)
+                w = torch.ops._c10d_functional.wait_tensor(y)
+                return torch.ops.test_fix_b.world_pallas_op(w, [0, 1, 2, 3, 4, 5, 6, 7])
+
+            return fx.symbolic_trace(forward)
+
+        assert _graph_fingerprint(_trace_with_world_pallas("1")) == _graph_fingerprint(
+            _trace_with_world_pallas("7")
+        )
+
+        monkeypatch.setattr(
+            tpu_compiler_mod, "_supports_global_subgroup_tiling", lambda: True
+        )
+        assert (
+            _graph_fingerprint(self._trace_all_reduce_graph("1"))
+            == _graph_fingerprint(self._trace_all_reduce_graph("3"))
+            == _graph_fingerprint(self._trace_all_reduce_graph("5"))
+            == _graph_fingerprint(self._trace_all_reduce_graph("7"))
+        )
+
+    def test_large_constant_tensor_beyond_65536_numel_does_not_collide(self):
+        """Non-Parameter get_attr constant tensors > 65536 elements are hashed
+        in full while nn.Parameter weights hash by dtype and shape."""
+        numel = tpu_compiler_mod._FINGERPRINT_MAX_NUMEL + 1
+        assert numel == 65537
+
+        const_a = torch.zeros(numel, dtype=torch.float32)
+        const_b = torch.zeros(numel, dtype=torch.float32)
+        const_b[-1] = 1.0
+
+        class _LargeConstMod(torch.nn.Module):
+            def __init__(self, const: torch.Tensor) -> None:
+                super().__init__()
+                self._tensor_constant0 = const
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return x + self._tensor_constant0
+
+        gm_const_a = fx.symbolic_trace(_LargeConstMod(const_a))
+        gm_const_b = fx.symbolic_trace(_LargeConstMod(const_b))
+
+        fp_const_a = _graph_fingerprint(gm_const_a)
+        fp_const_b = _graph_fingerprint(gm_const_b)
+        assert fp_const_a is not None
+        assert fp_const_b is not None
+        assert fp_const_a != fp_const_b
+
+        class _LargeParamMod(torch.nn.Module):
+            def __init__(self, weight: torch.Tensor) -> None:
+                super().__init__()
+                self.weight = torch.nn.Parameter(weight, requires_grad=False)
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return x + self.weight
+
+        gm_param_a = fx.symbolic_trace(_LargeParamMod(const_a))
+        gm_param_b = fx.symbolic_trace(_LargeParamMod(const_b))
+        assert _graph_fingerprint(gm_param_a) == _graph_fingerprint(gm_param_b)
+
+    def test_replay_from_peer_scans_all_candidate_paths_for_subgroup_peers(
+        self, tmp_path, monkeypatch
+    ):
+        """In 8-rank 4xTP2 subgroup-bound mode, each follower skips earlier
+        subgroups' artifacts in _peer_paths and replays its own subgroup
+        leader's artifact."""
+        _keep_alive = self._install_group_stand_ins(monkeypatch)
+        monkeypatch.setattr(tpu_compiler_mod, "_distributed_world_size", lambda: 8)
+        monkeypatch.setattr(
+            tpu_compiler_mod, "_supports_global_subgroup_tiling", lambda: False
+        )
+
+        tls = threading.local()
+        monkeypatch.setattr(
+            tpu_compiler_mod,
+            "_distributed_rank",
+            lambda: getattr(tls, "rank", None),
+        )
+
+        compilers, compile, compiled, _replayed = self._peer_compilers(
+            tmp_path, monkeypatch, n=8
+        )
+        rank_to_pg = {
+            0: "1",
+            1: "1",
+            2: "3",
+            3: "3",
+            4: "5",
+            5: "5",
+            6: "7",
+            7: "7",
+        }
+
+        def _compile_rank(r: int):
+            tls.rank = r
+            return compile(compilers[r], self._trace_all_reduce_graph(rank_to_pg[r]))
+
+        _compile_rank(0)
+
+        follower_threads: list[threading.Thread] = []
+        results: dict[int, tuple] = {}
+        followers_waiting = threading.Barrier(5)
+        orig_peer_paths = tpu_compiler_mod.TpuCompilerAdaptor._peer_paths
+
+        def _synced_peer_paths(adaptor, key):
+            if getattr(tls, "first_poll", False):
+                tls.first_poll = False
+                followers_waiting.wait(timeout=5.0)
+            return orig_peer_paths(adaptor, key)
+
+        monkeypatch.setattr(
+            tpu_compiler_mod.TpuCompilerAdaptor, "_peer_paths", _synced_peer_paths
+        )
+
+        def _run_waiter(r: int, is_follower: bool = False) -> None:
+            tls.first_poll = is_follower
+            with wait_for_peer_artifact(5.0):
+                results[r] = _compile_rank(r)
+
+        for r in (1, 3, 5, 7):
+            t = threading.Thread(target=_run_waiter, args=(r, True))
+            t.start()
+            follower_threads.append(t)
+
+        followers_waiting.wait(timeout=5.0)
+        for r in (2, 4, 6):
+            _run_waiter(r)
+
+        for t in follower_threads:
+            t.join(5.0)
+            assert not t.is_alive()
+
+        assert sorted(compiled) == [0, 2, 4, 6]
+        for follower, leader in ((1, 0), (3, 2), (5, 4), (7, 6)):
+            fn, (_, follower_path, _) = results[follower]
+            assert fn() == f"entry-from-rank-{leader}"
+            leader_cache_dir = compilers[leader].cache_dir
+            assert leader_cache_dir is not None
+            leader_path = os.path.join(leader_cache_dir, "artifact_bucket")
+            assert os.path.samefile(follower_path, leader_path)
+
+
+class _FakeBundledAOTEntry:
+    def __init__(self, *, fail: bool = False):
+        self.guards_expr = "guards"
+        self.sanitized_aot_config = None
+        self.fail = fail
+
+    def wrap_post_compile(self, example_inputs, aot_config, options):
+        if self.fail:
+            raise RuntimeError("wrap_post_compile failed")
+        return lambda boxed_args: sum(boxed_args)
+
+    def __deepcopy__(self, memo):
+        raise AssertionError("replay must not deepcopy the entry")
+
 
 def test_deserialize_entry_does_not_copy_the_entry():
-    """Replay rebuilds the runnable from the entry itself: a deepcopy would load
-    a second TPU executable."""
+    """Replay rebuilds the runnable from the entry itself without leaving a
+    __deepcopy__ override on the entry instance, even when deserialization
+    raises."""
+    import pickle
+
     from vllm_torchtpu.compilation.tpu_compiler import _deserialize_entry
 
-    class Entry:
-        def __init__(self):
-            self.guards_expr = "guards"
-            self.sanitized_aot_config = object()
+    entry = _FakeBundledAOTEntry()
+    assert _deserialize_entry(entry)(2, 3, 7) == 12
+    assert "__deepcopy__" not in entry.__dict__
+    assert isinstance(pickle.loads(pickle.dumps(entry)), _FakeBundledAOTEntry)
 
-        def wrap_post_compile(self, example_inputs, aot_config, options):
-            return lambda boxed_args: sum(boxed_args)
-
-    entry = Entry()
-    runnable = _deserialize_entry(entry)
-    assert runnable(1, 2, 3) == 6
+    failing_entry = _FakeBundledAOTEntry(fail=True)
+    with pytest.raises(RuntimeError, match="wrap_post_compile failed"):
+        _deserialize_entry(failing_entry)
+    assert "__deepcopy__" not in failing_entry.__dict__
+    assert isinstance(pickle.loads(pickle.dumps(failing_entry)), _FakeBundledAOTEntry)
