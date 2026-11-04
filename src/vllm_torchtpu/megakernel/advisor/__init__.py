@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypedDict
 
 from vllm_torchtpu.megakernel import errors
+from vllm_torchtpu.megakernel.advisor.calibrate import calibrate_trace
 from vllm_torchtpu.megakernel.advisor.chips import (
     BUILTIN_CHIP_SPECS,
     REQUIRED_CHIP_SPEC_KEYS,
@@ -2411,6 +2412,7 @@ __all__ = [
     "advise_from_spec",
     "advise_regimes",
     "build_arg_parser",
+    "calibrate_trace",
     "compare_parallelism_candidates",
     "compute_per_token_vmem_bytes",
     "default_double_buffer_ring_plan",
