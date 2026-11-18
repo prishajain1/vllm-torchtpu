@@ -376,6 +376,7 @@ def materialize_shared_attention_cache(
     kernel_block_size: int,
     attn_backend: Any,
     device: torch.device,
+    seq_along_lane: bool = False,
 ) -> torch.Tensor:
     """Allocate one tensor for attention groups sharing scheduler pages.
 
@@ -414,12 +415,14 @@ def materialize_shared_attention_cache(
         or math.prod(pool_shape) != num_blocks * page_elements
     ):
         # Keep the packed dtype axis separate when reinterpreting head shapes.
+        # Under SEQ_ALONG_LANE (HND), native 5D pages end in (packing, block_size),
+        # so place those two axes last to keep 4D <-> 5D views zero-copy bitcasts.
         packing = 4 // spec.dtype.itemsize
+        words_per_page = page_elements // (kernel_block_size * packing)
         pool_shape = (
-            num_blocks,
-            kernel_block_size,
-            packing,
-            page_elements // (kernel_block_size * packing),
+            (num_blocks, words_per_page, packing, kernel_block_size)
+            if seq_along_lane
+            else (num_blocks, kernel_block_size, packing, words_per_page)
         )
     return torch.zeros(pool_shape, dtype=spec.dtype, device=device)
 
