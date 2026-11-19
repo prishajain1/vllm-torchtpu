@@ -26,6 +26,7 @@ import torch
 from vllm.distributed import tensor_model_parallel_all_gather
 from vllm.model_executor.layers.linear import LinearBase
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.distributed.dcp import get_dcp_world_size
 from vllm_torchtpu.distributed.mesh_utils import get_pipeline_stage
@@ -36,6 +37,12 @@ from vllm_torchtpu.layers.adapter.custom_ops import fp8_linear_op
 # separate reduce-scatter and all-gather collectives cost more barrier latency
 # than the per-token norms and quantization save.
 MIN_SEQUENCE_PARALLEL_TOKENS = 1024
+
+
+def validate_sequence_parallel_env() -> None:
+    """Rejects sub-flags that require `TPU_DENSE_SEQUENCE_PARALLEL=1`."""
+    if envs.TPU_DENSE_SP_HIER_RS != "off" and not envs.TPU_DENSE_SEQUENCE_PARALLEL:
+        raise ValueError("TPU_DENSE_SP_HIER_RS requires TPU_DENSE_SEQUENCE_PARALLEL=1")
 
 
 def validate_sequence_parallel_config(tp_size: int) -> None:
