@@ -67,7 +67,7 @@ from vllm.model_executor.models.gemma4 import (
 )
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.layers.adapter import dense_sequence_parallel
+from vllm_torchtpu.layers.adapter import dense_sequence_parallel, gated_mlp_fp8
 from vllm_torchtpu.layers.adapter.custom_ops import (
     fp8_linear_op,
     fused_rs_epilogue_op,
@@ -248,7 +248,14 @@ def _attention_partial(
     return output
 
 
+_FUSED_MLP_VMEM_BYTES: int = 0
+
+
 def _mlp_partial(mlp: Gemma4MLP, gate_up: torch.Tensor) -> torch.Tensor:
+    if _FUSED_MLP_VMEM_BYTES > 0:
+        return gated_mlp_fp8.apply_gated_mlp_act_down(
+            gate_up, mlp.act_fn, mlp.down_proj, _FUSED_MLP_VMEM_BYTES
+        )
     output, _ = mlp.down_proj(mlp.act_fn(gate_up))
     return output
 
@@ -474,6 +481,16 @@ def maybe_patch_gemma4_dense_sequence_parallel(
         raise NotImplementedError(
             "TPU_DENSE_SEQUENCE_PARALLEL does not support LoRA adapters"
         )
+    global _FUSED_MLP_VMEM_BYTES
+    import jax.experimental.pallas.tpu as pltpu
+    from vllm_torchtpu.tpu_info import get_chip_version
+
+    if envs.TPU_FUSED_GATED_MLP_FP8 and get_chip_version() == pltpu.ChipVersion.TPU_7X:
+        _FUSED_MLP_VMEM_BYTES = int(
+            pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1).vmem_capacity_bytes
+        )
+    else:
+        _FUSED_MLP_VMEM_BYTES = 0
     Gemma4DecoderLayer.__init__ = _patched_layer_init
     # Upstream annotates return as tuple[Tensor, Tensor] while returning None.
     Gemma4DecoderLayer.forward = cast("Any", _dense_sequence_parallel_forward)
