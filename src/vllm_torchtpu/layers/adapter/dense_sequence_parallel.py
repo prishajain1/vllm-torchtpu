@@ -14,17 +14,18 @@
 """Model-independent sequence-parallel helpers for dense tensor-parallel layers.
 
 Instead of all-reducing each row-parallel linear's partial sum and repeating
-RMSNorms, residual adds, and FP8 quantization across all TP ranks, sequence
-parallelism reduce-scatters the partial sums along the token axis, runs the
-per-token ops on `num_tokens // tp_size` tokens per rank, and all-gathers the
-1-byte FP8 activations and f32 row scales for the next column-parallel linear.
+RMSNorms, residual adds, and (on FP8 models) row quantization across all TP
+ranks, sequence parallelism reduce-scatters the partial sums along the token
+axis, runs the per-token ops on `num_tokens // tp_size` tokens per rank, and
+all-gathers the next column-parallel linear's inputs (1-byte FP8 rows plus f32
+row scales for per-channel FP8 linears, or bf16 rows for unquantized linears).
 """
 
 from typing import Any
 
 import torch
 from vllm.distributed import tensor_model_parallel_all_gather
-from vllm.model_executor.layers.linear import LinearBase
+from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.compilation import shape_variants
@@ -63,6 +64,8 @@ def validate_sequence_parallel_config(tp_size: int) -> None:
 
 def validate_sharded_linear_config(linear: LinearBase) -> None:
     """Validates at layer init that `linear` supports sharded all-gather."""
+    if is_unquantized_linear(linear):
+        return
     fp8_linear_op.validate_fp8_linear_config(linear)
 
 
@@ -98,6 +101,13 @@ def all_gather_tokens(x_shard: torch.Tensor, num_tokens: Any) -> torch.Tensor:
     return tensor_model_parallel_all_gather(x_shard, 0).narrow(0, 0, num_tokens)
 
 
+def is_unquantized_linear(linear: LinearBase) -> bool:
+    """Whether `linear` uses `UnquantizedLinearMethod`."""
+    return isinstance(linear, LinearBase) and isinstance(
+        linear.quant_method, UnquantizedLinearMethod
+    )
+
+
 def all_gather_prequantized_fp8_linear(
     linear: LinearBase,
     x_q_shard: torch.Tensor,
@@ -116,7 +126,10 @@ def all_gather_prequantized_fp8_linear(
 def all_gather_linear(
     linear: LinearBase, x_shard: torch.Tensor, num_tokens: Any
 ) -> torch.Tensor:
-    """Quantizes `x_shard`, all-gathers across TP, and applies `linear`."""
+    """All-gathers `x_shard` (quantizing first for FP8 linears) and runs `linear`."""
+    if is_unquantized_linear(linear):
+        out, bias = linear(all_gather_tokens(x_shard, num_tokens))
+        return out if bias is None else out + bias
     x_q_shard, x_scale_shard = fp8_linear_op.quantize_fp8_activations(x_shard)
     return all_gather_prequantized_fp8_linear(
         linear, x_q_shard, x_scale_shard, num_tokens

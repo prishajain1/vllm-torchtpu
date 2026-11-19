@@ -140,6 +140,16 @@ def _configure_layer(
         )
     dense_sequence_parallel.validate_sharded_linear_config(layer.self_attn.qkv_proj)
     dense_sequence_parallel.validate_sharded_linear_config(layer.mlp.gate_up_proj)
+    unquant_qkv = dense_sequence_parallel.is_unquantized_linear(
+        layer.self_attn.qkv_proj
+    )
+    unquant_mlp = dense_sequence_parallel.is_unquantized_linear(layer.mlp.gate_up_proj)
+    if unquant_qkv != unquant_mlp:
+        raise NotImplementedError(
+            "TPU_DENSE_SEQUENCE_PARALLEL requires qkv_proj and gate_up_proj to "
+            "use the same quantization"
+        )
+    next_act_dtype = torch.bfloat16 if unquant_qkv else torch.float8_e4m3fn
     _validate_layer_norms(layer)
     cast("Any", layer.self_attn.o_proj).reduce_results = False
     cast("Any", layer.mlp.down_proj).reduce_results = False
@@ -153,7 +163,7 @@ def _configure_layer(
         ):
             streaming_collectives = (
                 fused_rs_epilogue_op.build_streaming_sublayer_collectives(
-                    eps, fp8_wire=payload == "fp8"
+                    eps, fp8_wire=payload == "fp8", next_act_dtype=next_act_dtype
                 )
             )
         else:
@@ -163,20 +173,22 @@ def _configure_layer(
                 payload,
                 hidden,
             )
-        if fused_rs_epilogue_op.supports_oneshot_sublayer(
-            fused_rs_epilogue_op.MIN_ONESHOT_RS_AG_TOKENS, hidden
-        ):
-            oneshot_collectives = (
-                fused_rs_epilogue_op.build_oneshot_sublayer_collectives(eps)
-            )
-        else:
-            logger.warning_once(
-                "TPU_DENSE_SP_HIER_RS=%s is set, but hidden=%d does not fit the "
-                "single-shot decode kernel; keeping XLA all-reduce below %d tokens.",
-                payload,
-                hidden,
-                dense_sequence_parallel.MIN_SEQUENCE_PARALLEL_TOKENS,
-            )
+        if not unquant_qkv:
+            if fused_rs_epilogue_op.supports_oneshot_sublayer(
+                fused_rs_epilogue_op.MIN_ONESHOT_RS_AG_TOKENS, hidden
+            ):
+                oneshot_collectives = (
+                    fused_rs_epilogue_op.build_oneshot_sublayer_collectives(eps)
+                )
+            else:
+                logger.warning_once(
+                    "TPU_DENSE_SP_HIER_RS=%s is set, but hidden=%d does not fit "
+                    "the single-shot decode kernel; keeping XLA all-reduce below "
+                    "%d tokens.",
+                    payload,
+                    hidden,
+                    dense_sequence_parallel.MIN_SEQUENCE_PARALLEL_TOKENS,
+                )
     state = _DenseSpLayerState(
         is_last_layer=layer.layer_idx == num_hidden_layers - 1,
         streaming_collectives=streaming_collectives,
@@ -305,20 +317,24 @@ def _sharded_forward(
     return hidden_states
 
 
-def _apply_quantized_linear(
+def _run_fused_next_linear(
     linear: LinearBase,
-    x_q: torch.Tensor,
-    x_scale: torch.Tensor,
+    epilogue_outputs: tuple[torch.Tensor, ...],
     num_tokens: Any,
-    *,
-    outputs_gathered: bool,
-) -> torch.Tensor:
-    if not outputs_gathered:
-        return dense_sequence_parallel.all_gather_prequantized_fp8_linear(
+    collectives: fused_rs_epilogue_op.FusedSublayerCollectives,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if collectives.next_act_dtype == torch.bfloat16:
+        residual, x_norm = epilogue_outputs
+        return residual, dense_sequence_parallel.all_gather_linear(
+            linear, x_norm, num_tokens
+        )
+    residual, x_q, x_scale = epilogue_outputs
+    if not collectives.outputs_gathered:
+        return residual, dense_sequence_parallel.all_gather_prequantized_fp8_linear(
             linear, x_q, x_scale, num_tokens
         )
     fp8_linear_op.validate_prequantized_fp8_linear(linear)
-    return fp8_linear_op.apply_prequantized_fp8_linear(linear, x_q, x_scale)
+    return residual, fp8_linear_op.apply_prequantized_fp8_linear(linear, x_q, x_scale)
 
 
 def _fused_sharded_forward(
@@ -356,33 +372,29 @@ def _fused_sharded_forward(
             )
     else:
         residual, post_norm_weight, scale = carried
-        residual, x_q, x_scale = collectives.norm_add_scale_next_norm(
-            hidden_states,
-            residual,
-            post_norm_weight,
-            scale,
-            layer.input_layernorm.weight,
-        )
-        qkv = _apply_quantized_linear(
+        residual, qkv = _run_fused_next_linear(
             attn.qkv_proj,
-            x_q,
-            x_scale,
+            collectives.norm_add_scale_next_norm(
+                hidden_states,
+                residual,
+                post_norm_weight,
+                scale,
+                layer.input_layernorm.weight,
+            ),
             num_tokens,
-            outputs_gathered=collectives.outputs_gathered,
+            collectives,
         )
 
-    residual, x_q, x_scale = collectives.norm_add_next_norm(
-        _attention_partial(attn, positions, qkv),
-        residual,
-        layer.post_attention_layernorm.weight,
-        layer.pre_feedforward_layernorm.weight,
-    )
-    gate_up = _apply_quantized_linear(
+    residual, gate_up = _run_fused_next_linear(
         layer.mlp.gate_up_proj,
-        x_q,
-        x_scale,
+        collectives.norm_add_next_norm(
+            _attention_partial(attn, positions, qkv),
+            residual,
+            layer.post_attention_layernorm.weight,
+            layer.pre_feedforward_layernorm.weight,
+        ),
         num_tokens,
-        outputs_gathered=collectives.outputs_gathered,
+        collectives,
     )
     mlp_partial = _mlp_partial(layer.mlp, gate_up)
     post_norm_weight = layer.post_feedforward_layernorm.weight
