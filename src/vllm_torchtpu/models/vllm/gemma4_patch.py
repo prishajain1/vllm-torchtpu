@@ -23,21 +23,27 @@ from the replicated embedding output and the final layer all-gathers the
 residual back to `[num_tokens, H]`.
 
 When `TPU_DENSE_SP_HIER_RS=bf16|fp8` is set on an 8-device tpu7x 2x2x1 TP
-group, eligible buckets fuse each reduce-scatter and its residual/RMSNorm/FP8
-epilogue into a single hierarchical Pallas kernel call.
+group, buckets `>= 1024` fuse each reduce-scatter and its residual/RMSNorm/FP8
+epilogue in the streaming kernel, while aligned buckets in `128 <= tokens <
+1024` fuse reduce-scatter, the epilogue, and the rank-ordered FP8 all-gather in
+a single-shot VMEM kernel.
 
 `_attention_partial`, `_replicated_forward`, `_sharded_forward`, and
 `_fused_sharded_forward` are adapted from upstream vLLM
 `vllm/model_executor/models/gemma4.py` (`Gemma4Attention` and
 `Gemma4DecoderLayer` at `v0.33.0`) with these changes:
 - `o_proj` and `down_proj` run with `reduce_results=False` so `_replicated_forward`
-  issues explicit `all_reduce`s and the sharded forwards issue `reduce_scatter`s.
-- `qkv_proj` and `gate_up_proj` consume pre-quantized FP8 rows gathered across TP
-  ranks (`k_eq_v` global-attention layers load `K` weights into both `K` and `V`
-  slots of `QKVParallelLinear` upstream, so `[q_size, kv_size, kv_size]` holds).
-- Layer 0 applies `narrow(0, 0, num_tokens)` or `slice_token_shard` for uniform
-  Dynamo symbolic inputs, and `_fused_sharded_forward` carries each non-final
-  layer's un-reduced `down_proj` tail via `Gemma4Model`'s `residual` slot.
+  issues explicit `all_reduce`s and `_sharded_forward` / `_fused_sharded_forward`
+  issue `reduce_scatter`s.
+- `qkv_proj` and `gate_up_proj` take pre-quantized FP8 rows gathered across TP.
+  Upstream `k_eq_v` global-attention layers load `K` weights into both `K` and
+  `V` slots of `QKVParallelLinear`, so the `[q_size, kv_size, kv_size]` split is
+  unchanged.
+- Layer 0 applies `narrow(0, 0, num_tokens)` (replicated / single-shot) or
+  `slice_token_shard` (sharded) so all buckets lift identical Dynamo symbolic
+  inputs, and `_fused_sharded_forward` carries
+  `(residual, post_feedforward_layernorm.weight, layer_scalar)` through
+  `Gemma4Model`'s `residual` slot into the next layer.
 """
 
 from __future__ import annotations
@@ -52,6 +58,7 @@ from vllm.distributed import (
     tensor_model_parallel_reduce_scatter,
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.models.gemma4 import (
     Gemma4Attention,
     Gemma4DecoderLayer,
@@ -61,7 +68,10 @@ from vllm.model_executor.models.gemma4 import (
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.layers.adapter import dense_sequence_parallel
-from vllm_torchtpu.layers.adapter.custom_ops import fused_rs_epilogue_op
+from vllm_torchtpu.layers.adapter.custom_ops import (
+    fp8_linear_op,
+    fused_rs_epilogue_op,
+)
 from vllm_torchtpu.logger import init_logger
 
 if TYPE_CHECKING:
@@ -77,6 +87,7 @@ _CarriedSublayerTail = tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 class _DenseSpLayerState:
     is_last_layer: bool
     streaming_collectives: fused_rs_epilogue_op.FusedSublayerCollectives | None = None
+    oneshot_collectives: fused_rs_epilogue_op.FusedSublayerCollectives | None = None
 
 
 def _validate_layer_norms(layer: Gemma4DecoderLayer) -> None:
@@ -133,28 +144,43 @@ def _configure_layer(
     cast("Any", layer.self_attn.o_proj).reduce_results = False
     cast("Any", layer.mlp.down_proj).reduce_results = False
     payload = envs.TPU_DENSE_SP_HIER_RS
-    streaming_collectives = None
+    streaming_collectives = oneshot_collectives = None
     if payload != "off":
         hidden = layer.input_layernorm.weight.shape[0]
+        eps = layer.input_layernorm.variance_epsilon
         if fused_rs_epilogue_op.supports_streaming_sublayer(
             fused_rs_epilogue_op.MIN_STREAMING_RS_TOKENS, hidden
         ):
             streaming_collectives = (
                 fused_rs_epilogue_op.build_streaming_sublayer_collectives(
-                    layer.input_layernorm.variance_epsilon,
-                    fp8_wire=payload == "fp8",
+                    eps, fp8_wire=payload == "fp8"
                 )
             )
         else:
             logger.warning_once(
-                "TPU_DENSE_SP_HIER_RS=%s is set, but hidden=%d does not fit "
-                "the streaming epilogue; keeping XLA reduce-scatter.",
+                "TPU_DENSE_SP_HIER_RS=%s is set, but hidden=%d does not fit the "
+                "streaming epilogue kernel; keeping XLA reduce-scatter.",
                 payload,
                 hidden,
+            )
+        if fused_rs_epilogue_op.supports_oneshot_sublayer(
+            fused_rs_epilogue_op.MIN_ONESHOT_RS_AG_TOKENS, hidden
+        ):
+            oneshot_collectives = (
+                fused_rs_epilogue_op.build_oneshot_sublayer_collectives(eps)
+            )
+        else:
+            logger.warning_once(
+                "TPU_DENSE_SP_HIER_RS=%s is set, but hidden=%d does not fit the "
+                "single-shot decode kernel; keeping XLA all-reduce below %d tokens.",
+                payload,
+                hidden,
+                dense_sequence_parallel.MIN_SEQUENCE_PARALLEL_TOKENS,
             )
     state = _DenseSpLayerState(
         is_last_layer=layer.layer_idx == num_hidden_layers - 1,
         streaming_collectives=streaming_collectives,
+        oneshot_collectives=oneshot_collectives,
     )
     cast("Any", layer)._tpu_dense_sp = state
 
@@ -279,6 +305,22 @@ def _sharded_forward(
     return hidden_states
 
 
+def _apply_quantized_linear(
+    linear: LinearBase,
+    x_q: torch.Tensor,
+    x_scale: torch.Tensor,
+    num_tokens: Any,
+    *,
+    outputs_gathered: bool,
+) -> torch.Tensor:
+    if not outputs_gathered:
+        return dense_sequence_parallel.all_gather_prequantized_fp8_linear(
+            linear, x_q, x_scale, num_tokens
+        )
+    fp8_linear_op.validate_prequantized_fp8_linear(linear)
+    return fp8_linear_op.apply_prequantized_fp8_linear(linear, x_q, x_scale)
+
+
 def _fused_sharded_forward(
     layer: Gemma4DecoderLayer,
     positions: torch.Tensor,
@@ -292,7 +334,10 @@ def _fused_sharded_forward(
     Because `down_proj`'s fused epilogue consumes the next layer's
     `input_layernorm.weight`, non-final layers return the un-reduced `down_proj`
     partial sum plus `carried = (residual, post_feedforward_layernorm.weight,
-    layer_scalar)` via `Gemma4Model`'s `residual` carry slot.
+    layer_scalar)` via `Gemma4Model`'s `residual` carry slot. When
+    `collectives.outputs_gathered` is True (single-shot decode), `x_q`,
+    `x_scale`, and the final layer's residual come back already gathered in TP
+    rank order, and layer 0 runs `qkv_proj` directly on the replicated rows.
     """
     num_tokens = positions.shape[0]
     attn = layer.self_attn
@@ -300,9 +345,15 @@ def _fused_sharded_forward(
         residual = dense_sequence_parallel.slice_token_shard(
             hidden_states, num_tokens, attn.o_proj.tp_rank, attn.o_proj.tp_size
         )
-        qkv = dense_sequence_parallel.all_gather_linear(
-            attn.qkv_proj, layer.input_layernorm(residual), num_tokens
-        )
+        if collectives.outputs_gathered:
+            fp8_linear_op.validate_prequantized_fp8_linear(attn.qkv_proj)
+            qkv, _ = attn.qkv_proj(
+                layer.input_layernorm(hidden_states.narrow(0, 0, num_tokens))
+            )
+        else:
+            qkv = dense_sequence_parallel.all_gather_linear(
+                attn.qkv_proj, layer.input_layernorm(residual), num_tokens
+            )
     else:
         residual, post_norm_weight, scale = carried
         residual, x_q, x_scale = collectives.norm_add_scale_next_norm(
@@ -312,8 +363,12 @@ def _fused_sharded_forward(
             scale,
             layer.input_layernorm.weight,
         )
-        qkv = dense_sequence_parallel.all_gather_prequantized_fp8_linear(
-            attn.qkv_proj, x_q, x_scale, num_tokens
+        qkv = _apply_quantized_linear(
+            attn.qkv_proj,
+            x_q,
+            x_scale,
+            num_tokens,
+            outputs_gathered=collectives.outputs_gathered,
         )
 
     residual, x_q, x_scale = collectives.norm_add_next_norm(
@@ -322,8 +377,12 @@ def _fused_sharded_forward(
         layer.post_attention_layernorm.weight,
         layer.pre_feedforward_layernorm.weight,
     )
-    gate_up = dense_sequence_parallel.all_gather_prequantized_fp8_linear(
-        layer.mlp.gate_up_proj, x_q, x_scale, num_tokens
+    gate_up = _apply_quantized_linear(
+        layer.mlp.gate_up_proj,
+        x_q,
+        x_scale,
+        num_tokens,
+        outputs_gathered=collectives.outputs_gathered,
     )
     mlp_partial = _mlp_partial(layer.mlp, gate_up)
     post_norm_weight = layer.post_feedforward_layernorm.weight
@@ -332,7 +391,9 @@ def _fused_sharded_forward(
     residual = collectives.norm_add_scale(
         mlp_partial, residual, post_norm_weight, layer.layer_scalar
     )
-    return dense_sequence_parallel.all_gather_tokens(residual, num_tokens), None
+    if not collectives.outputs_gathered:
+        residual = dense_sequence_parallel.all_gather_tokens(residual, num_tokens)
+    return residual, None
 
 
 def _dense_sequence_parallel_forward(
@@ -345,26 +406,40 @@ def _dense_sequence_parallel_forward(
 ) -> tuple[torch.Tensor, _CarriedSublayerTail | None]:
     del per_layer_input, kwargs
     num_tokens = positions.shape[0]
-    if not dense_sequence_parallel.should_shard_tokens(
-        num_tokens, self.mlp.down_proj.tp_size
-    ):
-        return _replicated_forward(self, positions, hidden_states), None
+    tp_size = self.mlp.down_proj.tp_size
+    hidden = hidden_states.shape[-1]
     state = _layer_state(self)
+    if dense_sequence_parallel.should_shard_tokens(num_tokens, tp_size):
+        if (
+            state.streaming_collectives is not None
+            and fused_rs_epilogue_op.supports_streaming_sublayer(num_tokens, hidden)
+        ):
+            return _fused_sharded_forward(
+                self,
+                positions,
+                hidden_states,
+                residual,
+                state.streaming_collectives,
+                state.is_last_layer,
+            )
+        return _sharded_forward(self, positions, hidden_states), None
     if (
-        state.streaming_collectives is not None
-        and fused_rs_epilogue_op.supports_streaming_sublayer(
-            num_tokens, hidden_states.shape[-1]
+        (
+            not torch.compiler.is_compiling()
+            or dense_sequence_parallel.shape_variants.aot_cache_tag() is not None
         )
+        and state.oneshot_collectives is not None
+        and fused_rs_epilogue_op.supports_oneshot_sublayer(num_tokens, hidden)
     ):
         return _fused_sharded_forward(
             self,
             positions,
             hidden_states,
             residual,
-            state.streaming_collectives,
+            state.oneshot_collectives,
             state.is_last_layer,
         )
-    return _sharded_forward(self, positions, hidden_states), None
+    return _replicated_forward(self, positions, hidden_states), None
 
 
 def maybe_patch_gemma4_dense_sequence_parallel(
